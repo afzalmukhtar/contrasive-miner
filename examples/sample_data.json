@@ -1,0 +1,62 @@
+[
+    {
+        "anchor": "What was Apple's revenue in 2025?",
+        "positives": [
+            "Apple's revenue in 2025 was $450 billion, representing a 12% increase from the previous year."
+        ]
+    },
+    {
+        "anchor": "Who is the CEO of Apple?",
+        "positives": [
+            "Tim Cook has been the CEO of Apple since 2011, succeeding Steve Jobs."
+        ]
+    },
+    {
+        "anchor": "What were Apple's operating expenses?",
+        "positives": [
+            "Apple's operating expenses for 2025 totaled $58 billion, including R&D and marketing costs."
+        ]
+    },
+    {
+        "anchor": "What is Apple's EBITDA margin?",
+        "positives": [
+            "Apple's EBITDA margin was 35% in 2025, reflecting strong operational efficiency."
+        ]
+    },
+    {
+        "anchor": "How many employees does Apple have?",
+        "positives": [
+            "Apple employs approximately 164,000 full-time employees worldwide as of 2025."
+        ]
+    },
+    {
+        "anchor": "What is Apple's market capitalization?",
+        "positives": [
+            "Apple's market capitalization exceeded $3 trillion in 2025, making it the most valuable publicly traded company."
+        ]
+    },
+    {
+        "anchor": "What are Apple's main product categories?",
+        "positives": [
+            "Apple's main product categories include iPhone, Mac, iPad, Wearables, and Services."
+        ]
+    },
+    {
+        "anchor": "What is Apple's gross profit margin?",
+        "positives": [
+            "Apple's gross profit margin was 45% in 2025, driven by strong Services revenue."
+        ]
+    },
+    {
+        "anchor": "How much did Apple spend on R&D?",
+        "positives": [
+            "Apple's R&D spending reached $30 billion in 2025, focused on AI and hardware innovation."
+        ]
+    },
+    {
+        "anchor": "What is Apple's dividend yield?",
+        "positives": [
+            "Apple's dividend yield was approximately 0.5% in 2025, with quarterly dividends of $0.24 per share."
+        ]
+    }
+]
