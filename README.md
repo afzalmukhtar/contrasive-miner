@@ -132,6 +132,22 @@ Use `--group-by-anchor` to combine repeated queries.
 | `stage2_n_hard` | 1 | Hard negatives from query similarity |
 | `stage2_n_random` | 1 | Random negatives from query similarity |
 
+## 🚀 Case Study: Financial Domain Adaptation
+
+Using `contrastive-miner` to train a simple **Linear Adapter** on financial data yielded projected performance gains compared to standard random negative sampling.
+
+**Impact on Downstream Retrieval (NDCG@10):**
+
+| Method | NDCG@10 | Recall@10 | Improvement |
+|--------|---------|-----------|-------------|
+| Random Sampling (Baseline) | 0.379 | 57.6% | - |
+| **Contrastive Miner** | **0.460** | **67.2%** | **+21%** |
+
+> "The better quality of hard negatives allowed a simple linear layer to learn robust domain-specific distinctions that previously required full model fine-tuning."
+
+🔴 **Verify these results:**
+Check out the full implementation and benchmarks in the [Fine-Tuning Embeddings on Domain-Specific Data](https://github.com/afzalmukhtar/fine-tuning-embeddings-on-domain-specific-data) repository.
+
 ## License
 
 MIT

@@ -8,41 +8,12 @@ Defines the data structures for:
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Set
+from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
 import json
 
 
 @dataclass
-class IntermediateRow:
-    """
-    Intermediate format that preserves stage-specific negatives.
-
-    This is saved first for debugging and analysis before
-    flattening to the final TripletRow format.
-    """
-
-    anchor: str
-    positive: str
-
-    # Stage 1: Document Retrieval Negatives
-    hard_neg_doc: List[str] = field(default_factory=list)
-    random_neg_doc: List[str] = field(default_factory=list)
-
-    # Stage 2: Query Similarity Negatives
-    hard_neg_query: List[str] = field(default_factory=list)
-    random_neg_query: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "IntermediateRow":
-        """Create from dictionary."""
-        return cls(**data)
-
-
 @dataclass
 class TripletRow:
     """
@@ -50,108 +21,116 @@ class TripletRow:
 
     Each row has one positive and multiple negatives that can be
     used with MultipleNegativesRankingLoss or TripletLoss.
+
+    Optional metadata fields support quality analysis from stratified mining.
     """
 
     anchor: str
     positive: str
     negatives: List[str] = field(default_factory=list)
 
+    # Optional metadata for quality analysis (from stratified mining)
+    negative_sources: List[str] = field(default_factory=list)
+    negative_similarities: List[float] = field(default_factory=list)
+    mining_stats: Optional["MiningStats"] = None
+
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        result = {
+            "anchor": self.anchor,
+            "positive": self.positive,
+            "negatives": self.negatives,
+        }
+        # Only include metadata if present
+        if self.negative_sources:
+            result["negative_sources"] = self.negative_sources
+        if self.negative_similarities:
+            result["negative_similarities"] = self.negative_similarities
+        if self.mining_stats:
+            result["mining_stats"] = asdict(self.mining_stats)
+        return result
 
     @classmethod
     def from_dict(cls, data: dict) -> "TripletRow":
         """Create from dictionary."""
-        return cls(**data)
-
-    @classmethod
-    def from_intermediate(cls, intermediate: IntermediateRow) -> "TripletRow":
-        """
-        Flatten an IntermediateRow to TripletRow.
-
-        Combines all negatives from both stages into a single list.
-        """
-        all_negatives = (
-            intermediate.hard_neg_doc
-            + intermediate.random_neg_doc
-            + intermediate.hard_neg_query
-            + intermediate.random_neg_query
-        )
-        # Deduplicate while preserving order
-        seen: Set[str] = set()
-        unique_negatives = []
-        for neg in all_negatives:
-            if neg not in seen:
-                seen.add(neg)
-                unique_negatives.append(neg)
-
+        stats = None
+        if "mining_stats" in data and data["mining_stats"]:
+            stats = MiningStats(**data["mining_stats"])
         return cls(
-            anchor=intermediate.anchor,
-            positive=intermediate.positive,
-            negatives=unique_negatives,
+            anchor=data["anchor"],
+            positive=data["positive"],
+            negatives=data.get("negatives", []),
+            negative_sources=data.get("negative_sources", []),
+            negative_similarities=data.get("negative_similarities", []),
+            mining_stats=stats,
         )
 
 
 class MinerConfig(BaseModel):
-    """Configuration for the SemanticNegativeMiner."""
+    """
+    Configuration for the SemanticNegativeMiner with stratified sampling.
 
-    # Stage 1: Document Retrieval config
-    stage1_n_hard: int = Field(
-        default=1, description="Number of hard negatives from document retrieval"
+    Stage 1: Direct document retrieval with Hard/Medium/Easy bucketing
+    Stage 2: Topic neighbor mining from similar queries
+    """
+
+    # Stage 1: Direct Retrieval with stratified sampling
+    stage1_retrieve_k: int = Field(
+        default=200,
+        description="Number of candidates to retrieve for stratified mining",
     )
-    stage1_n_random: int = Field(
-        default=1, description="Number of random negatives from document retrieval"
+    stage1_similarity_threshold: float = Field(
+        default=0.75,
+        description="Filter candidates with similarity > threshold to positive",
     )
-    stage1_retrieve_buffer: int = Field(
-        default=10, description="Extra chunks to retrieve for filtering buffer"
+    stage1_hard_range: Tuple[int, int] = Field(
+        default=(0, 20), description="Index range for hard negatives (top ranks)"
+    )
+    stage1_medium_range: Tuple[int, int] = Field(
+        default=(20, 50), description="Index range for medium negatives"
+    )
+    stage1_easy_range: Tuple[int, int] = Field(
+        default=(50, 200), description="Index range for easy negatives"
     )
 
-    # Stage 2: Query Similarity config
+    # Stage 2: Topic Neighbors
     stage2_top_queries: int = Field(
         default=10, description="Number of similar queries to retrieve"
     )
-    stage2_n_hard: int = Field(
-        default=1, description="Number of hard negatives from query similarity"
-    )
-    stage2_n_random: int = Field(
-        default=1, description="Number of random negatives from query similarity"
+    stage2_similarity_threshold: float = Field(
+        default=0.75, description="Filter threshold for stage 2 candidates"
     )
 
-    # General config
-    embedding_model: str = Field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
-        description="Embedding model for similarity computation",
+    # Sampling multipliers
+    multiplier: int = Field(default=1, description="Base multiplier for each bin")
+    hard_multiplier: int = Field(default=2, description="Multiplier for hard negatives")
+    medium_multiplier: int = Field(
+        default=2, description="Multiplier for medium negatives"
     )
-    use_reranker: bool = Field(
-        default=False, description="Whether to use cross-encoder for re-ranking"
+    easy_multiplier: int = Field(default=2, description="Multiplier for easy negatives")
+    stage2_multiplier: int = Field(default=2, description="Multiplier for stage 2")
+
+    # Cross-Encoder
+    cross_encoder_model: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-12-v2",
+        description="Cross-encoder model for reranking",
     )
-    reranker_model: Optional[str] = Field(
-        default=None, description="Cross-encoder model for re-ranking"
+    cross_encoder_batch_size: int = Field(
+        default=32, description="Batch size for cross-encoder"
     )
+
+    # Embedding
     batch_size: int = Field(
         default=32, description="Batch size for embedding computation"
     )
 
+    # Performance
+    use_gpu: bool = Field(default=True, description="Whether to use GPU if available")
+    show_progress: bool = Field(default=True, description="Show progress bars")
+
     def to_dict(self) -> dict:
         """Convert to dictionary."""
         return self.model_dump()
-
-
-def save_intermediate(rows: List[IntermediateRow], path: str) -> None:
-    """Save intermediate rows to JSONL file."""
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
-
-
-def load_intermediate(path: str) -> List[IntermediateRow]:
-    """Load intermediate rows from JSONL file."""
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            rows.append(IntermediateRow.from_dict(json.loads(line)))
-    return rows
 
 
 def save_triplets(rows: List[TripletRow], path: str) -> None:
@@ -170,8 +149,80 @@ def load_triplets(path: str) -> List[TripletRow]:
     return rows
 
 
-def flatten_intermediate_to_triplets(
-    intermediate_rows: List[IntermediateRow],
-) -> List[TripletRow]:
-    """Convert all intermediate rows to triplet rows."""
-    return [TripletRow.from_intermediate(row) for row in intermediate_rows]
+# =============================================================================
+# Advanced Mining Data Models
+# =============================================================================
+
+
+@dataclass
+class CandidateNegative:
+    """
+    Represents a candidate negative with metadata.
+
+    Tracks the source and similarity scores for analysis.
+    """
+
+    text: str
+    score: float  # From retriever or cross-encoder
+    source: str  # 'stage1_hard', 'stage1_medium', 'stage1_easy', 'stage2'
+    query_similarity: float = 0.0
+    positive_similarity: float = 0.0
+
+
+@dataclass
+class MiningStats:
+    """
+    Track mining statistics for debugging and quality analysis.
+
+    Captures counts and average similarities at each stage.
+    """
+
+    # Stage 1
+    stage1_retrieved: int = 0
+    stage1_filtered_exact: int = 0
+    stage1_filtered_similar: int = 0
+    stage1_after_filter: int = 0
+    stage1_hard_sampled: int = 0
+    stage1_medium_sampled: int = 0
+    stage1_easy_sampled: int = 0
+
+    # Stage 2
+    stage2_candidates: int = 0
+    stage2_filtered_similar: int = 0
+    stage2_sampled: int = 0
+
+    # Final
+    total_before_dedup: int = 0
+    total_after_dedup: int = 0
+
+    # Quality metrics
+    avg_hard_similarity: float = 0.0
+    avg_medium_similarity: float = 0.0
+    avg_easy_similarity: float = 0.0
+    avg_stage2_similarity: float = 0.0
+
+    def log_summary(self, logger) -> None:
+        """Print comprehensive summary."""
+        logger.info("=" * 60)
+        logger.info("MINING STATISTICS")
+        logger.info("=" * 60)
+        logger.info(f"Stage 1 Retrieved: {self.stage1_retrieved}")
+        logger.info(f"  Filtered (Exact): {self.stage1_filtered_exact}")
+        logger.info(f"  Filtered (>0.75 sim): {self.stage1_filtered_similar}")
+        logger.info(f"  Valid Candidates: {self.stage1_after_filter}")
+        logger.info(f"  Sampled Hard: {self.stage1_hard_sampled}")
+        logger.info(f"  Sampled Medium: {self.stage1_medium_sampled}")
+        logger.info(f"  Sampled Easy: {self.stage1_easy_sampled}")
+        logger.info("-" * 60)
+        logger.info(f"Stage 2 Candidates: {self.stage2_candidates}")
+        logger.info(f"  Filtered: {self.stage2_filtered_similar}")
+        logger.info(f"  Sampled: {self.stage2_sampled}")
+        logger.info("-" * 60)
+        logger.info(f"Total Before Dedup: {self.total_before_dedup}")
+        logger.info(f"Total After Dedup: {self.total_after_dedup}")
+        logger.info("-" * 60)
+        logger.info(f"Avg Hard Similarity: {self.avg_hard_similarity:.3f}")
+        logger.info(f"Avg Medium Similarity: {self.avg_medium_similarity:.3f}")
+        logger.info(f"Avg Easy Similarity: {self.avg_easy_similarity:.3f}")
+        logger.info(f"Avg Stage2 Similarity: {self.avg_stage2_similarity:.3f}")
+        logger.info("=" * 60)

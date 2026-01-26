@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "contrastive-miner"
-version = "0.1.0"
+version = "0.2.0"
 description = "A two-stage hard negative mining library for contrastive learning"
 readme = "README.md"
 requires-python = ">=3.9"

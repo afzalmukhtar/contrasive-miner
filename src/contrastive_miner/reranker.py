@@ -6,7 +6,7 @@ Uses a default cross-encoder from sentence-transformers or accepts:
 - A user-provided reranking function with signature: (query: str, candidates: List[str]) -> List[Tuple[str, float]]
 """
 
-from typing import List, Optional, Tuple, Callable, Protocol
+from typing import List, Dict, Optional, Tuple, Callable, Protocol
 import logging
 
 logger = logging.getLogger(__name__)
@@ -123,8 +123,8 @@ class Reranker:
         # Create query-candidate pairs (same format as sentence-transformers)
         pairs = [[query, candidate] for candidate in candidates]
 
-        # Get cross-encoder scores
-        scores = self.cross_encoder.predict(pairs)
+        # Get cross-encoder scores (no progress bar for per-query calls)
+        scores = self.cross_encoder.predict(pairs, show_progress_bar=False)
 
         # Sort by score descending
         indexed_scores = list(enumerate(scores))
@@ -148,3 +148,52 @@ class Reranker:
         """
         results = self.rerank(query, candidates, top_n)
         return [text for text, _ in results]
+
+    def rerank_with_scores(
+        self, query: str, candidates: List[str], top_n: Optional[int] = None
+    ) -> List[Tuple[str, float]]:
+        """
+        Re-rank and return texts WITH scores.
+
+        This is critical for stratified sampling where we need
+        to track similarity scores.
+
+        Args:
+            query: Query text
+            candidates: Candidate texts to rank
+            top_n: Number of top candidates to return (None = all)
+
+        Returns:
+            List of (candidate, score) tuples, sorted by score descending
+        """
+        return self.rerank(query, candidates, top_n)
+
+    def rerank_to_bins(
+        self,
+        query: str,
+        candidates: List[str],
+        hard_range: Tuple[int, int] = (0, 20),
+        medium_range: Tuple[int, int] = (20, 50),
+        easy_range: Tuple[int, int] = (50, 200),
+    ) -> Dict[str, List[Tuple[str, float]]]:
+        """
+        Re-rank and automatically bin into Hard/Medium/Easy.
+
+        Args:
+            query: Query text
+            candidates: Candidate texts to rank
+            hard_range: Index range for hard negatives (top ranks)
+            medium_range: Index range for medium negatives
+            easy_range: Index range for easy negatives
+
+        Returns:
+            Dict with 'hard', 'medium', 'easy' keys, each containing
+            a list of (text, score) tuples
+        """
+        all_ranked = self.rerank_with_scores(query, candidates, top_n=None)
+
+        return {
+            "hard": all_ranked[hard_range[0] : hard_range[1]],
+            "medium": all_ranked[medium_range[0] : medium_range[1]],
+            "easy": all_ranked[easy_range[0] : easy_range[1]],
+        }

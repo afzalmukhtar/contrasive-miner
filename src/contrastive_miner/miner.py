@@ -2,8 +2,8 @@
 Semantic Negative Miner - Two-Stage Hard Negative Mining.
 
 The core class that implements:
-- Stage 1: Direct document retrieval negatives
-- Stage 2: Query similarity negatives
+- Stage 1: Direct document retrieval negatives with stratified sampling
+- Stage 2: Topic neighbor mining via query similarity
 
 Accepts user-provided embedding model (SentenceTransformer or callable).
 Uses default cross-encoder for reranking unless user provides one.
@@ -16,33 +16,33 @@ from tqdm import tqdm
 import numpy as np
 
 from .models import (
-    IntermediateRow,
     TripletRow,
     MinerConfig,
-    save_intermediate,
     save_triplets,
-    flatten_intermediate_to_triplets,
+    CandidateNegative,
+    MiningStats,
 )
 from .index import VectorIndex
 from .reranker import Reranker
+from .utils.similarity import filter_by_similarity
 
 logger = logging.getLogger(__name__)
 
 
 class SemanticNegativeMiner:
     """
-    Two-stage hard negative mining for contrastive learning.
+    Two-stage hard negative mining for contrastive learning with stratified sampling.
 
     Stage 1: Direct Document Retrieval
         - Retrieve chunks for query
         - Filter out positive chunks
         - Re-rank remaining
-        - Select hard and random negatives
+        - Stratified sampling into Hard/Medium/Easy buckets
 
-    Stage 2: Query Similarity
+    Stage 2: Topic Neighbor Mining
         - Find similar queries
         - Gather their positives
-        - Filter out original positives
+        - Filter out original positives and high similarity chunks
         - Re-rank and select negatives
 
     Args:
@@ -98,31 +98,21 @@ class SemanticNegativeMiner:
         # Random number generator for reproducibility
         self.rng = np.random.default_rng(42)
 
-    def _encode(self, texts: Union[str, List[str]]) -> np.ndarray:
-        """
-        Encode texts using the embedder.
+        # Internal flag for progress bars
+        self._suppress_progress = False
 
-        Supports:
-        - SentenceTransformer (with .encode() method)
-        - Callable function
-        """
+    def _encode(self, texts: Union[str, List[str]]) -> np.ndarray:
+        """Encode texts using the embedder."""
         if hasattr(self.embedder, "encode"):
-            # SentenceTransformer-like
             return self.embedder.encode(
                 texts,
-                show_progress_bar=isinstance(texts, list) and len(texts) > 100,
                 batch_size=self.config.batch_size,
-                convert_to_numpy=True,
+                show_progress_bar=not self._suppress_progress
+                and self.config.show_progress,
+                device="cuda" if self.config.use_gpu else "cpu",
             )
-        elif callable(self.embedder):
-            # Custom function
-            result = self.embedder(texts)
-            return np.array(result) if not isinstance(result, np.ndarray) else result
         else:
-            raise ValueError(
-                "Embedder must have .encode() method (like SentenceTransformer) "
-                "or be callable"
-            )
+            return self.embedder(texts)
 
     def build_indices(self, data: List[Dict[str, Any]]) -> None:
         """
@@ -131,288 +121,464 @@ class SemanticNegativeMiner:
         Args:
             data: List of dicts with 'anchor'/'query' and 'positives'/'positive'
         """
-        logger.info("Building indices from data...")
+        logger.info("Building indices...")
 
-        # Normalize data format
-        normalized_data = self._normalize_data(data)
+        # Collect all unique chunks and queries
+        chunks = set()
+        queries = []
 
-        # Collect unique chunks and build mappings
-        unique_chunks: Set[str] = set()
-        queries: List[str] = []
-        query_metadata: List[Dict] = []
+        # Pre-scan to normalize keys
+        normalized = self._normalize_data(data)
 
-        for item in normalized_data:
+        for item in tqdm(normalized, desc="Processing data"):
             anchor = item["anchor"]
             positives = item["positives"]
 
             queries.append(anchor)
-            self.query_to_positives[anchor] = set(positives)
+            for p in positives:
+                chunks.add(p)
 
-            for chunk in positives:
-                unique_chunks.add(chunk)
+            # Map query to positives for exclusion
+            if anchor not in self.query_to_positives:
+                self.query_to_positives[anchor] = set()
+            self.query_to_positives[anchor].update(positives)
 
-            query_metadata.append({"anchor": anchor, "positives": positives})
+        self.all_chunks = list(chunks)
+        self.chunk_to_index = {chunk: i for i, chunk in enumerate(self.all_chunks)}
 
-        self.all_chunks = list(unique_chunks)
-        self.chunk_to_index = {chunk: idx for idx, chunk in enumerate(self.all_chunks)}
-
-        logger.info(
-            f"Found {len(self.all_chunks)} unique chunks and {len(queries)} queries"
-        )
-
-        # Build chunk index
-        logger.info("Encoding chunks...")
+        logger.info(f"Encoding {len(self.all_chunks)} unique chunks...")
         chunk_embeddings = self._encode(self.all_chunks)
 
-        chunk_metadata = [
-            {"text": chunk, "chunk_index": idx}
-            for idx, chunk in enumerate(self.all_chunks)
-        ]
+        logger.info(f"Encoding {len(queries)} queries...")
+        query_vecs = self._encode(queries)
 
-        self.chunk_index = VectorIndex(chunk_embeddings, chunk_metadata)
+        # Build FAISS indices
+        self.chunk_index = VectorIndex(
+            embeddings=chunk_embeddings,
+            metadata=[{"text": t} for t in self.all_chunks],
+            use_faiss=self.config.use_gpu,  # Map use_gpu to use_faiss
+        )
 
-        # Build query index
-        logger.info("Encoding queries...")
-        query_embeddings = self._encode(queries)
+        self.query_index = VectorIndex(
+            embeddings=query_vecs,
+            metadata=normalized,  # Store full items as metadata
+            use_faiss=self.config.use_gpu,
+        )
+        logger.info("Indices built successfully.")
 
-        self.query_index = VectorIndex(query_embeddings, query_metadata)
-
-        logger.info("Indices built successfully")
-
-    def _normalize_data(self, data: List[Dict]) -> List[Dict]:
-        """
-        Normalize data to consistent format.
-
-        Supports:
-        - {"anchor": "...", "positives": [...]}
-        - {"query": "...", "positive": "..."}
-        - {"query": "...", "positives": [...]}
-        """
+    def _normalize_data(self, data: List[Dict]) -> List[Dict[str, Any]]:
+        """Normalize data to consistent format."""
         normalized = []
         for item in data:
             anchor = item.get("anchor") or item.get("query")
-            positives = item.get("positives")
+            positives = item.get("positives") or item.get("positive")
 
-            if positives is None:
-                positive = item.get("positive")
-                positives = [positive] if positive else []
+            if isinstance(positives, str):
+                positives = [positives]
 
             if anchor and positives:
                 normalized.append(
-                    {
-                        "anchor": anchor,
-                        "positives": positives
-                        if isinstance(positives, list)
-                        else [positives],
-                    }
+                    {"anchor": anchor, "positives": positives}  # Keep as list
                 )
 
         return normalized
 
-    def mine_stage1_doc(
+    def mine_stage1_stratified(
         self, anchor: str, positives: Set[str]
-    ) -> Tuple[List[str], List[str]]:
+    ) -> Tuple[List[CandidateNegative], MiningStats]:
         """
-        Stage 1: Mine negatives via direct document retrieval.
+        Stage 1: Stratified Hard Negative Mining with Validation.
+
+        1. Retrieve Top K from FAISS
+        2. Filter False Positives (>threshold similarity)
+        3. Cross-Encoder Rerank
+        4. Stratified Sampling into Hard/Medium/Easy buckets
 
         Args:
             anchor: Query text
             positives: Set of positive chunk texts
 
         Returns:
-            (hard_negatives, random_negatives)
+            (candidates, stats)
         """
+        stats = MiningStats()
+
         if self.chunk_index is None:
             raise RuntimeError("Call build_indices() first")
 
-        n_retrieve = (
-            len(positives)
-            + self.config.stage1_n_hard
-            + self.config.stage1_retrieve_buffer
+        # Step 1: Retrieve Top K from FAISS
+        query_vec = self._encode(anchor)
+        results, result_embeddings = self.chunk_index.search_with_embeddings(
+            query_vec,
+            self.config.stage1_retrieve_k,
+            exclude_indices=None,
+            return_embeddings=True,
         )
 
-        # Get indices of positive chunks to exclude
-        exclude_indices = {
-            self.chunk_to_index[p] for p in positives if p in self.chunk_to_index
-        }
+        stats.stage1_retrieved = len(results)
 
-        # Encode query and search
-        query_vec = self._encode(anchor)
-        results = self.chunk_index.search(query_vec, n_retrieve, exclude_indices)
+        if not results or result_embeddings is None:
+            # logger.warning(f"No results for query: {anchor[:50]}")
+            return [], stats
 
-        # Get candidate chunks (already filtered by exclude_indices)
-        candidates = [r["text"] for r in results]
+        # Step 2: Filter False Positives
+        candidate_texts = [r["text"] for r in results]
 
-        # Re-rank to get hard negatives
-        hard_negatives = []
-        if candidates and self.config.stage1_n_hard > 0:
-            reranked = self.reranker.get_top_texts(
-                anchor, candidates, self.config.stage1_n_hard
+        # Get positive embedding for similarity check
+        positive_text = list(positives)[0]  # Use first positive as reference
+        positive_embedding = self.chunk_index.get_embedding_by_text(positive_text)
+
+        if positive_embedding is None:
+            # logger.warning(f"Could not find embedding for positive: {positive_text[:50]}")
+            positive_embedding = self._encode(positive_text)
+
+        # Filter using similarity
+        valid_texts, valid_embeddings, filtered_count, query_similarities = (
+            filter_by_similarity(
+                query_vec,
+                positive_embedding,
+                result_embeddings,
+                candidate_texts,
+                positive_text,
+                threshold=self.config.stage1_similarity_threshold,
             )
-            hard_negatives = reranked
+        )
 
-        # Sample random negatives (not in positives or hard negatives)
-        random_negatives = []
-        if self.config.stage1_n_random > 0:
-            forbidden = exclude_indices | {
-                self.chunk_to_index[h]
-                for h in hard_negatives
-                if h in self.chunk_to_index
-            }
-            random_indices = self.chunk_index.get_random_indices(
-                self.config.stage1_n_random, forbidden, self.rng
+        stats.stage1_filtered_similar = filtered_count
+        stats.stage1_after_filter = len(valid_texts)
+
+        if len(valid_texts) == 0:
+            return [], stats
+
+        # Step 3: Cross-Encoder Rerank
+        ranked = self.reranker.rerank_to_bins(
+            anchor,
+            valid_texts,
+            hard_range=self.config.stage1_hard_range,
+            medium_range=self.config.stage1_medium_range,
+            easy_range=self.config.stage1_easy_range,
+        )
+
+        # Step 4: Stratified Sampling
+        candidates = []
+        cfg = self.config
+
+        # Sample Hard
+        hard_pool = ranked["hard"]
+        n_hard = min(len(hard_pool), cfg.hard_multiplier * cfg.multiplier)
+        if n_hard > 0 and len(hard_pool) > 0:
+            hard_indices = self.rng.choice(
+                len(hard_pool), size=min(n_hard, len(hard_pool)), replace=False
             )
-            random_negatives = [self.all_chunks[idx] for idx in random_indices]
+            for idx in hard_indices:
+                text, score = hard_pool[idx]
+                candidates.append(
+                    CandidateNegative(
+                        text=text,
+                        score=score,
+                        source="stage1_hard",
+                        query_similarity=score,
+                    )
+                )
+            stats.stage1_hard_sampled = len(hard_indices)
+            hard_sims = [hard_pool[i][1] for i in hard_indices]
+            stats.avg_hard_similarity = float(np.mean(hard_sims))
 
-        return hard_negatives, random_negatives
+        # Sample Medium
+        medium_pool = ranked["medium"]
+        n_medium = min(len(medium_pool), cfg.medium_multiplier * cfg.multiplier)
+        if n_medium > 0 and len(medium_pool) > 0:
+            medium_indices = self.rng.choice(
+                len(medium_pool), size=min(n_medium, len(medium_pool)), replace=False
+            )
+            for idx in medium_indices:
+                text, score = medium_pool[idx]
+                candidates.append(
+                    CandidateNegative(
+                        text=text,
+                        score=score,
+                        source="stage1_medium",
+                        query_similarity=score,
+                    )
+                )
+            stats.stage1_medium_sampled = len(medium_indices)
+            medium_sims = [medium_pool[i][1] for i in medium_indices]
+            stats.avg_medium_similarity = float(np.mean(medium_sims))
 
-    def mine_stage2_query(
+        # Sample Easy
+        easy_pool = ranked["easy"]
+        n_easy = min(len(easy_pool), cfg.easy_multiplier * cfg.multiplier)
+        if n_easy > 0 and len(easy_pool) > 0:
+            easy_indices = self.rng.choice(
+                len(easy_pool), size=min(n_easy, len(easy_pool)), replace=False
+            )
+            for idx in easy_indices:
+                text, score = easy_pool[idx]
+                candidates.append(
+                    CandidateNegative(
+                        text=text,
+                        score=score,
+                        source="stage1_easy",
+                        query_similarity=score,
+                    )
+                )
+            stats.stage1_easy_sampled = len(easy_indices)
+            easy_sims = [easy_pool[i][1] for i in easy_indices]
+            stats.avg_easy_similarity = float(np.mean(easy_sims))
+
+        return candidates, stats
+
+    def mine_stage2_topic_neighbors(
         self, anchor: str, positives: Set[str]
-    ) -> Tuple[List[str], List[str]]:
+    ) -> Tuple[List[CandidateNegative], MiningStats]:
         """
-        Stage 2: Mine negatives via query similarity.
+        Stage 2: Topic Neighbor Mining.
+
+        1. Find similar queries
+        2. Extract their positives
+        3. Filter high similarity to original positive
+        4. Cross-encoder rerank
+        5. Random sample
 
         Args:
             anchor: Query text
             positives: Set of positive chunk texts
 
         Returns:
-            (hard_negatives, random_negatives)
+            (candidates, stats)
         """
+        stats = MiningStats()
+
         if self.query_index is None:
             raise RuntimeError("Call build_indices() first")
 
-        # Encode query and find similar queries
+        # Step 1: Find Similar Queries
         query_vec = self._encode(anchor)
         similar_queries = self.query_index.search(
             query_vec, self.config.stage2_top_queries + 1
         )
 
-        # Collect positives from similar queries (excluding the anchor itself)
+        # Step 2: Collect Their Positives
         candidate_chunks: Set[str] = set()
         for result in similar_queries:
             if result["anchor"] == anchor:
                 continue  # Skip self
 
             for chunk in result["positives"]:
-                if chunk not in positives:  # Filter out original positives
+                # Exclude original positives
+                if chunk not in positives:
                     candidate_chunks.add(chunk)
 
-        candidates = list(candidate_chunks)
+        candidate_list = list(candidate_chunks)
+        stats.stage2_candidates = len(candidate_list)
 
-        # Re-rank to get hard negatives
-        hard_negatives = []
-        if candidates and self.config.stage2_n_hard > 0:
-            reranked = self.reranker.get_top_texts(
-                anchor, candidates, self.config.stage2_n_hard
+        if len(candidate_list) == 0:
+            return [], stats
+
+        # Step 3: Filter High Similarity to Original Positive
+        positive_text = list(positives)[0]
+        positive_embedding = self.chunk_index.get_embedding_by_text(positive_text)
+
+        if positive_embedding is None:
+            positive_embedding = self._encode(positive_text)
+
+        # Get embeddings for candidates
+        candidate_embeddings = self.chunk_index.batch_get_embeddings(candidate_list)
+
+        if len(candidate_embeddings) == 0:
+            # logger.warning("Stage 2: Could not find embeddings for candidates")
+            return [], stats
+
+        # Filter
+        valid_texts, valid_embeddings, filtered_count, query_similarities = (
+            filter_by_similarity(
+                query_vec,
+                positive_embedding,
+                candidate_embeddings,
+                candidate_list,
+                positive_text,
+                threshold=self.config.stage2_similarity_threshold,
             )
-            hard_negatives = reranked
+        )
 
-        # Sample random negatives
-        random_negatives = []
-        if self.config.stage2_n_random > 0:
-            # Forbidden: positives + hard negatives + all candidates
-            forbidden_chunks = positives | set(hard_negatives) | candidate_chunks
-            forbidden_indices = {
-                self.chunk_to_index[c]
-                for c in forbidden_chunks
-                if c in self.chunk_to_index
-            }
+        stats.stage2_filtered_similar = filtered_count
 
-            random_indices = self.chunk_index.get_random_indices(
-                self.config.stage2_n_random, forbidden_indices, self.rng
-            )
-            random_negatives = [self.all_chunks[idx] for idx in random_indices]
+        if len(valid_texts) == 0:
+            return [], stats
 
-        return hard_negatives, random_negatives
+        # Step 4: Cross-Encoder Rerank
+        ranked = self.reranker.rerank_with_scores(anchor, valid_texts, top_n=None)
 
-    def mine_row(self, anchor: str, positives: List[str]) -> List[IntermediateRow]:
+        # Step 5: Random Sample
+        cfg = self.config
+        n_sample = min(len(ranked), cfg.stage2_multiplier * cfg.multiplier)
+
+        candidates = []
+        if n_sample > 0:
+            sample_indices = self.rng.choice(len(ranked), size=n_sample, replace=False)
+            for idx in sample_indices:
+                text, score = ranked[idx]
+                candidates.append(
+                    CandidateNegative(
+                        text=text,
+                        score=score,
+                        source="stage2_topic_neighbor",
+                        query_similarity=score,
+                    )
+                )
+            stats.stage2_sampled = n_sample
+
+            stage2_sims = [ranked[i][1] for i in sample_indices]
+            stats.avg_stage2_similarity = float(np.mean(stage2_sims))
+
+        return candidates, stats
+
+    def mine_row(
+        self, anchor: str, positives: List[str]
+    ) -> Tuple[List[TripletRow], MiningStats]:
         """
-        Mine negatives for a single anchor and its positives.
+        Mine negatives for a single anchor using stratified sampling.
 
-        Creates one IntermediateRow per positive (exploded).
+        This is the main orchestrator that combines Stage 1 and Stage 2.
 
         Args:
             anchor: Query text
             positives: List of positive chunks
 
         Returns:
-            List of IntermediateRows (one per positive)
+            (triplet_rows, combined_stats)
         """
         positives_set = set(positives)
+        combined_stats = MiningStats()
 
-        # Stage 1: Document retrieval negatives
-        hard_doc, random_doc = self.mine_stage1_doc(anchor, positives_set)
+        # Stage 1: Stratified Mining
+        stage1_candidates, stage1_stats = self.mine_stage1_stratified(
+            anchor, positives_set
+        )
 
-        # Stage 2: Query similarity negatives
-        hard_query, random_query = self.mine_stage2_query(anchor, positives_set)
+        # Stage 2: Topic Neighbors
+        stage2_candidates, stage2_stats = self.mine_stage2_topic_neighbors(
+            anchor, positives_set
+        )
 
-        # Explode: one row per positive
+        # Combine candidates
+        all_candidates = stage1_candidates + stage2_candidates
+
+        # Merge stats
+        combined_stats.stage1_retrieved = stage1_stats.stage1_retrieved
+        combined_stats.stage1_filtered_similar = stage1_stats.stage1_filtered_similar
+        combined_stats.stage1_after_filter = stage1_stats.stage1_after_filter
+        combined_stats.stage1_hard_sampled = stage1_stats.stage1_hard_sampled
+        combined_stats.stage1_medium_sampled = stage1_stats.stage1_medium_sampled
+        combined_stats.stage1_easy_sampled = stage1_stats.stage1_easy_sampled
+        combined_stats.stage2_candidates = stage2_stats.stage2_candidates
+        combined_stats.stage2_filtered_similar = stage2_stats.stage2_filtered_similar
+        combined_stats.stage2_sampled = stage2_stats.stage2_sampled
+        combined_stats.avg_hard_similarity = stage1_stats.avg_hard_similarity
+        combined_stats.avg_medium_similarity = stage1_stats.avg_medium_similarity
+        combined_stats.avg_easy_similarity = stage1_stats.avg_easy_similarity
+        combined_stats.avg_stage2_similarity = stage2_stats.avg_stage2_similarity
+
+        combined_stats.total_before_dedup = len(all_candidates)
+
+        # Deduplicate
+        seen_texts = set()
+        unique_candidates = []
+        for cand in all_candidates:
+            if cand.text not in seen_texts and cand.text not in positives_set:
+                seen_texts.add(cand.text)
+                unique_candidates.append(cand)
+
+        combined_stats.total_after_dedup = len(unique_candidates)
+
+        # Create rows (one per positive)
         rows = []
         for positive in positives:
+            negative_texts = [c.text for c in unique_candidates]
+            negative_sources = [c.source for c in unique_candidates]
+            negative_similarities = [c.score for c in unique_candidates]
+
             rows.append(
-                IntermediateRow(
+                TripletRow(
                     anchor=anchor,
                     positive=positive,
-                    hard_neg_doc=hard_doc.copy(),
-                    random_neg_doc=random_doc.copy(),
-                    hard_neg_query=hard_query.copy(),
-                    random_neg_query=random_query.copy(),
+                    negatives=negative_texts,
+                    negative_sources=negative_sources,
+                    negative_similarities=negative_similarities,
+                    mining_stats=combined_stats,
                 )
             )
 
-        return rows
+        return rows, combined_stats
 
     def mine_dataset(
         self,
         data: List[Dict[str, Any]],
-        intermediate_path: Optional[str] = None,
-        final_path: Optional[str] = None,
+        output_path: Optional[str] = None,
         build_indices: bool = True,
-    ) -> Tuple[List[IntermediateRow], List[TripletRow]]:
+        log_stats: bool = True,
+    ) -> List[TripletRow]:
         """
-        Mine negatives for entire dataset.
+        Mine negatives for entire dataset using stratified mining.
 
         Args:
             data: Input data with anchors and positives
-            intermediate_path: Path to save intermediate results (stage-specific)
-            final_path: Path to save final triplets
-            build_indices: Whether to rebuild indices (False if already built)
+            output_path: Path to save triplets (JSON lines)
+            build_indices: Whether to rebuild indices
+            log_stats: Whether to log aggregate statistics
 
         Returns:
-            (intermediate_rows, triplet_rows)
+            List of TripletRow
         """
         if build_indices:
             self.build_indices(data)
 
         normalized_data = self._normalize_data(data)
 
-        intermediate_rows: List[IntermediateRow] = []
+        all_rows: List[TripletRow] = []
+        aggregate_stats = MiningStats()
 
-        logger.info("Mining negatives...")
-        for item in tqdm(normalized_data, desc="Mining"):
-            rows = self.mine_row(item["anchor"], item["positives"])
-            intermediate_rows.extend(rows)
+        logger.info("Mining negatives with stratified sampling...")
+        self._suppress_progress = True
+        try:
+            for item in tqdm(normalized_data, desc="Mining"):
+                rows, stats = self.mine_row(item["anchor"], item["positives"])
+                all_rows.extend(rows)
 
-        # Save intermediate
-        if intermediate_path:
-            logger.info(f"Saving intermediate results to {intermediate_path}")
-            save_intermediate(intermediate_rows, intermediate_path)
+                # Aggregate stats
+                aggregate_stats.stage1_retrieved += stats.stage1_retrieved
+                aggregate_stats.stage1_filtered_similar += stats.stage1_filtered_similar
+                aggregate_stats.stage1_after_filter += stats.stage1_after_filter
+                aggregate_stats.stage1_hard_sampled += stats.stage1_hard_sampled
+                aggregate_stats.stage1_medium_sampled += stats.stage1_medium_sampled
+                aggregate_stats.stage1_easy_sampled += stats.stage1_easy_sampled
+                aggregate_stats.stage2_candidates += stats.stage2_candidates
+                aggregate_stats.stage2_filtered_similar += stats.stage2_filtered_similar
+                aggregate_stats.stage2_sampled += stats.stage2_sampled
+                aggregate_stats.total_before_dedup += stats.total_before_dedup
+                aggregate_stats.total_after_dedup += stats.total_after_dedup
+        finally:
+            self._suppress_progress = False
 
-        # Flatten to final format
-        triplet_rows = flatten_intermediate_to_triplets(intermediate_rows)
+        # Compute averages for quality metrics
+        n = len(normalized_data)
+        if n > 0:
+            aggregate_stats.avg_hard_similarity /= n
+            aggregate_stats.avg_medium_similarity /= n
+            aggregate_stats.avg_easy_similarity /= n
+            aggregate_stats.avg_stage2_similarity /= n
 
-        # Save final
-        if final_path:
-            logger.info(f"Saving final triplets to {final_path}")
-            save_triplets(triplet_rows, final_path)
+        if log_stats:
+            aggregate_stats.log_summary(logger)
 
-        logger.info(
-            f"Mining complete: {len(intermediate_rows)} intermediate rows, "
-            f"{len(triplet_rows)} triplet rows"
-        )
+        # Save if path provided
+        if output_path:
+            logger.info(f"Saving triplets to {output_path}")
+            save_triplets(all_rows, output_path)
 
-        return intermediate_rows, triplet_rows
+        logger.info(f"Mining complete: {len(all_rows)} triplet rows")
+
+        return all_rows
 
     @classmethod
     def from_file(

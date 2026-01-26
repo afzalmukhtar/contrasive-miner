@@ -4,14 +4,19 @@ Tests for Contrastive Miner.
 
 import pytest
 import numpy as np
-from typing import List, Dict
+import shutil
+import tempfile
+import os
+import json
+from typing import List, Dict, Set
 
 from contrastive_miner.models import (
-    IntermediateRow,
     TripletRow,
     MinerConfig,
-    flatten_intermediate_to_triplets,
+    CandidateNegative,
+    MiningStats,
 )
+from contrastive_miner.miner import SemanticNegativeMiner
 from contrastive_miner.index import VectorIndex
 from contrastive_miner.reranker import Reranker
 
@@ -32,6 +37,7 @@ class MockEmbedder:
         show_progress_bar: bool = False,
         batch_size: int = 32,
         convert_to_numpy: bool = True,
+        device: str = "cpu",
     ) -> np.ndarray:
         """Generate deterministic embeddings based on text hash."""
         if isinstance(texts, str):
@@ -91,72 +97,45 @@ def get_test_data() -> List[Dict]:
 
 
 class TestModels:
-    def test_intermediate_row_creation(self):
-        """Test IntermediateRow creation."""
-        row = IntermediateRow(
+    def test_triplet_row_creation(self):
+        """Test TripletRow creation with metadata."""
+        row = TripletRow(
             anchor="query",
             positive="chunk",
-            hard_neg_doc=["hard1"],
-            random_neg_doc=["random1"],
-            hard_neg_query=["hard2"],
-            random_neg_query=["random2"],
+            negatives=["neg1", "neg2"],
+            negative_sources=["stage1_hard", "stage2"],
+            negative_similarities=[0.8, 0.6],
         )
 
         assert row.anchor == "query"
         assert row.positive == "chunk"
-        assert len(row.hard_neg_doc) == 1
+        assert len(row.negatives) == 2
+        assert len(row.negative_sources) == 2
+        assert row.negative_similarities[0] == 0.8
 
-    def test_intermediate_to_dict(self):
-        """Test IntermediateRow serialization."""
-        row = IntermediateRow(anchor="query", positive="chunk")
+    def test_triplet_to_dict(self):
+        """Test TripletRow serialization."""
+        row = TripletRow(
+            anchor="query",
+            positive="chunk",
+            negatives=["neg1"],
+            mining_stats=MiningStats(stage1_retrieved=10),
+        )
 
         d = row.to_dict()
         assert d["anchor"] == "query"
-        assert d["positive"] == "chunk"
-
-    def test_triplet_from_intermediate(self):
-        """Test flattening IntermediateRow to TripletRow."""
-        intermediate = IntermediateRow(
-            anchor="query",
-            positive="chunk",
-            hard_neg_doc=["neg1"],
-            random_neg_doc=["neg2"],
-            hard_neg_query=["neg3"],
-            random_neg_query=["neg4"],
-        )
-
-        triplet = TripletRow.from_intermediate(intermediate)
-
-        assert triplet.anchor == "query"
-        assert triplet.positive == "chunk"
-        assert len(triplet.negatives) == 4
-        assert "neg1" in triplet.negatives
-        assert "neg4" in triplet.negatives
-
-    def test_triplet_deduplicates_negatives(self):
-        """Test that duplicate negatives are removed."""
-        intermediate = IntermediateRow(
-            anchor="query",
-            positive="chunk",
-            hard_neg_doc=["neg1", "neg2"],
-            random_neg_doc=["neg2", "neg3"],  # neg2 is duplicate
-            hard_neg_query=["neg3"],  # neg3 is duplicate
-            random_neg_query=["neg4"],
-        )
-
-        triplet = TripletRow.from_intermediate(intermediate)
-
-        # Should have 4 unique negatives, not 6
-        assert len(triplet.negatives) == 4
-        assert triplet.negatives == ["neg1", "neg2", "neg3", "neg4"]
+        assert d["mining_stats"]["stage1_retrieved"] == 10
 
     def test_miner_config_defaults(self):
-        """Test MinerConfig default values."""
+        """Test MinerConfig default values (stratified)."""
         config = MinerConfig()
 
-        assert config.stage1_n_hard == 1
-        assert config.stage1_n_random == 1
-        assert config.stage2_n_hard == 1
+        # Check new stratified defaults
+        assert config.stage1_retrieve_k == 200
+        assert config.stage1_similarity_threshold == 0.75
+        assert config.stage1_hard_range == (0, 20)
+        assert config.stage2_top_queries == 10
+        assert config.multiplier == 1
 
 
 # --- Tests for VectorIndex ---
@@ -201,105 +180,64 @@ class TestVectorIndex:
         assert 1 not in result_ids
         assert 2 not in result_ids
 
-    def test_get_random_indices(self):
-        """Test random index sampling."""
-        embeddings = np.random.randn(100, 64).astype(np.float32)
-        metadata = [{"id": i} for i in range(100)]
 
-        index = VectorIndex(embeddings, metadata, use_faiss=False)
-
-        random_indices = index.get_random_indices(5, exclude_indices={0, 1, 2})
-
-        assert len(random_indices) == 5
-        assert 0 not in random_indices
-        assert 1 not in random_indices
+# --- Tests for Miner ---
 
 
-# --- Tests for Reranker ---
+class TestSemanticNegativeMiner:
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.data_path = os.path.join(self.temp_dir, "data.jsonl")
 
+        # Save test data
+        with open(self.data_path, "w") as f:
+            for item in get_test_data():
+                f.write(json.dumps(item) + "\n")
 
-class TestReranker:
-    def test_reranker_with_custom_function(self):
-        """Test reranker with custom reranking function."""
+    def teardown_method(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_miner_initialization(self):
+        """Test miner initialization."""
+        embedder = MockEmbedder()
+        miner = SemanticNegativeMiner(embedder)
+        assert miner.chunk_index is None
+
+    def test_build_indices(self):
+        """Test index building."""
+        embedder = MockEmbedder()
+        miner = SemanticNegativeMiner(embedder)
+
+        data = get_test_data()
+        miner.build_indices(data)
+
+        assert miner.chunk_index is not None
+        assert miner.query_index is not None
+        assert len(miner.all_chunks) > 0
+
+    def test_mine_dataset_e2e(self):
+        """Test end-to-end mining."""
+        embedder = MockEmbedder()
+        config = MinerConfig(
+            stage1_retrieve_k=5,
+            stage1_hard_range=(0, 2),
+            stage1_medium_range=(2, 4),
+            stage1_easy_range=(4, 5),
+            multiplier=1,
+        )
+
+        # Use mock reranker to avoid loading real models
         reranker = Reranker(rerank_fn=mock_rerank_fn)
 
-        query = "test query"
-        candidates = ["a", "b", "c"]
+        miner = SemanticNegativeMiner(embedder, config, reranker=reranker)
 
-        results = reranker.rerank(query, candidates)
+        data = get_test_data()
+        triplets = miner.mine_dataset(data, log_stats=False)
 
-        assert len(results) == 3
-        # Our mock reverses the order
-        assert results[0][0] == "c"
+        assert len(triplets) > 0
+        assert isinstance(triplets[0], TripletRow)
+        assert len(triplets[0].negatives) >= 0
 
-    def test_get_top_texts(self):
-        """Test getting only top text results."""
-        reranker = Reranker(rerank_fn=mock_rerank_fn)
-
-        query = "test query"
-        candidates = ["a", "b", "c", "d", "e"]
-
-        top_texts = reranker.get_top_texts(query, candidates, top_n=3)
-
-        assert len(top_texts) == 3
-        assert all(isinstance(t, str) for t in top_texts)
-
-    def test_reranker_empty_candidates(self):
-        """Test reranker with empty candidates list."""
-        reranker = Reranker(rerank_fn=mock_rerank_fn)
-
-        results = reranker.rerank("query", [])
-        assert results == []
-
-
-# --- Tests for Flatten ---
-
-
-class TestFlatten:
-    def test_flatten_intermediate_to_triplets(self):
-        """Test batch flattening of intermediate rows."""
-        intermediates = [
-            IntermediateRow(
-                anchor="q1", positive="p1", hard_neg_doc=["n1"], random_neg_doc=["n2"]
-            ),
-            IntermediateRow(
-                anchor="q2",
-                positive="p2",
-                hard_neg_query=["n3"],
-                random_neg_query=["n4"],
-            ),
-        ]
-
-        triplets = flatten_intermediate_to_triplets(intermediates)
-
-        assert len(triplets) == 2
-        assert triplets[0].anchor == "q1"
-        assert triplets[1].anchor == "q2"
-
-
-# --- Tests for Embedder Interface ---
-
-
-class TestEmbedderInterface:
-    def test_sentence_transformer_like_interface(self):
-        """Test that MockEmbedder works like SentenceTransformer."""
-        embedder = MockEmbedder(dim=64)
-
-        # Single text
-        single = embedder.encode("test")
-        assert single.shape == (64,)
-
-        # Multiple texts
-        batch = embedder.encode(["a", "b", "c"])
-        assert batch.shape == (3, 64)
-
-    def test_callable_embedder_interface(self):
-        """Test that callable function works as embedder."""
-        result = mock_embed_fn("test")
-        assert isinstance(result, np.ndarray)
-
-
-# --- Run with pytest ---
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

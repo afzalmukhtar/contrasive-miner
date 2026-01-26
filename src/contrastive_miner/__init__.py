@@ -14,15 +14,15 @@ Usage:
 
     # Configure mining
     config = MinerConfig(
-        stage1_n_hard=2,
-        stage1_n_random=1,
-        stage2_n_hard=2,
-        stage2_n_random=1
+        stage1_retrieve_k=200,
+        stage1_similarity_threshold=0.75,
+        stage1_hard_range=(0, 20),
+        multiplier=2
     )
 
     # Mine negatives (uses default cross-encoder for reranking)
     miner = SemanticNegativeMiner(embedder, config)
-    intermediate, triplets = miner.mine_dataset(data)
+    triplets = miner.mine_dataset(data)
 
     # Or provide custom reranker
     from sentence_transformers import CrossEncoder
@@ -30,7 +30,12 @@ Usage:
     miner = SemanticNegativeMiner(embedder, config, cross_encoder=reranker)
 """
 
-from .models import TripletRow, MinerConfig, IntermediateRow
+from .models import (
+    TripletRow,
+    MinerConfig,
+    CandidateNegative,
+    MiningStats,
+)
 from .miner import SemanticNegativeMiner
 from .index import VectorIndex
 from .reranker import Reranker
@@ -48,8 +53,9 @@ __all__ = [
     "SemanticNegativeMiner",
     # Models
     "TripletRow",
-    "IntermediateRow",
     "MinerConfig",
+    "CandidateNegative",
+    "MiningStats",
     # Components
     "VectorIndex",
     "Reranker",

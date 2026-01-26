@@ -175,5 +175,68 @@ class VectorIndex:
         """Get metadata for a specific index."""
         return self.metadata[idx]
 
+    def search_with_embeddings(
+        self,
+        query_vec: np.ndarray,
+        top_k: int,
+        exclude_indices: Optional[set] = None,
+        return_embeddings: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
+        """
+        Search and optionally return embeddings for filtering.
+
+        Args:
+            query_vec: Query embedding
+            top_k: Number of results
+            exclude_indices: Indices to exclude
+            return_embeddings: Whether to return embeddings
+
+        Returns:
+            (results, embeddings) if return_embeddings=True
+            (results, None) otherwise
+        """
+        results = self.search(query_vec, top_k, exclude_indices)
+
+        if return_embeddings and results:
+            indices = [r["index"] for r in results]
+            result_embeddings = self.normalized_embeddings[indices]
+            return results, result_embeddings
+
+        return results, None
+
+    def get_embedding_by_text(self, text: str) -> Optional[np.ndarray]:
+        """
+        Get embedding for a specific text.
+
+        Args:
+            text: Text to find embedding for
+
+        Returns:
+            Normalized embedding or None if not found
+        """
+        for i, meta in enumerate(self.metadata):
+            if meta.get("text") == text:
+                return self.normalized_embeddings[i]
+        return None
+
+    def batch_get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """
+        Get embeddings for multiple texts.
+
+        Args:
+            texts: List of texts to get embeddings for
+
+        Returns:
+            Array of embeddings (may be smaller than texts if some not found)
+        """
+        embeddings = []
+        for text in texts:
+            emb = self.get_embedding_by_text(text)
+            if emb is not None:
+                embeddings.append(emb)
+        if len(embeddings) == 0:
+            return np.array([]).reshape(0, self.normalized_embeddings.shape[1])
+        return np.array(embeddings)
+
     def __len__(self) -> int:
         return len(self.embeddings)
