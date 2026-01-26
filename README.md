@@ -31,13 +31,13 @@ from contrastive_miner import SemanticNegativeMiner, MinerConfig
 # Load model
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# Configure mining
+# Configure mining (Stratified Sampling)
 config = MinerConfig(
-    stage1_n_hard=2,
-    stage1_n_random=1,
+    stage1_retrieve_k=200,
+    stage1_hard_range=(0, 20),
+    hard_multiplier=2,
     stage2_top_queries=10,
-    stage2_n_hard=2,
-    stage2_n_random=1
+    stage2_multiplier=2
 )
 
 # Create miner
@@ -49,26 +49,11 @@ data = [
     {"anchor": "Who is the CEO?", "positives": ["The CEO is..."]},
 ]
 
-intermediate, triplets = miner.mine_dataset(
+# Returns List[TripletRow]
+triplets = miner.mine_dataset(
     data,
-    intermediate_path="intermediate.jsonl",
-    final_path="triplets.jsonl"
+    output_path="triplets.jsonl"
 )
-```
-
-### CLI
-
-```bash
-python -m contrastive_miner \
-    --input train.json \
-    --output triplets.jsonl \
-    --model sentence-transformers/all-MiniLM-L6-v2 \
-    --stage1-n-hard 2 \
-    --stage1-n-random 1 \
-    --stage2-n-hard 2 \
-    --stage2-n-random 1 \
-    --intermediate intermediate.jsonl \
-    --group-by-anchor
 ```
 
 ## Input Format
@@ -79,58 +64,51 @@ Supports multiple formats:
 {"query": "query", "positive": "chunk"}
 ```
 
-Use `--group-by-anchor` to combine repeated queries.
 
 ## Output Format
 
-### Intermediate (Stage-specific)
-```json
-{
-    "anchor": "query",
-    "positive": "chunk",
-    "hard_neg_doc": ["from stage 1"],
-    "random_neg_doc": ["from stage 1"],
-    "hard_neg_query": ["from stage 2"],
-    "random_neg_query": ["from stage 2"]
-}
-```
 
 ### Final (Flattened)
 ```json
 {
     "anchor": "query",
     "positive": "chunk",
-    "negatives": ["all negatives combined"]
+    "negatives": ["negative1", "negative2", ...],
+    "negative_sources": ["stage1_hard", "stage2_topic_neighbor", ...],
+    "negative_similarities": [0.85, 0.42, ...]
 }
 ```
 
 ## Algorithm
 
-### Stage 1: Document Retrieval
+### Stage 1: Document Retrieval (Stratified)
 1. Retrieve top-K chunks for query
-2. Filter out positive chunks
-3. Re-rank remaining by relevance
-4. Select top-n as hard negatives
-5. Sample random chunks as random negatives
+2. Filter out positive chunks & high similarity false positives
+3. Re-rank remaining by relevance with Cross-Encoder
+4. Bucket into **Hard**, **Medium**, and **Easy** tiers
+5. Sample negatives from each bucket based on multipliers
 
-### Stage 2: Query Similarity
+### Stage 2: Topic Neighbor Mining
 1. Find top-Y similar queries
 2. Collect their positives as candidates
 3. Filter out original positives
 4. Re-rank by original query
-5. Select top-n as hard negatives
-6. Sample random as random negatives
+5. Select negatives based on `stage2_multiplier`
 
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `stage1_n_hard` | 1 | Hard negatives from doc retrieval |
-| `stage1_n_random` | 1 | Random negatives from doc retrieval |
-| `stage1_retrieve_buffer` | 10 | Extra chunks to retrieve |
-| `stage2_top_queries` | 10 | Similar queries to retrieve |
-| `stage2_n_hard` | 1 | Hard negatives from query similarity |
-| `stage2_n_random` | 1 | Random negatives from query similarity |
+| `stage1_retrieve_k` | 200 | Initial candidates to retrieve |
+| `stage1_hard_range` | (0, 20) | Rank range for "Hard" negatives |
+| `stage1_medium_range` | (20, 50) | Rank range for "Medium" negatives |
+| `stage1_easy_range` | (50, 200) | Rank range for "Easy" negatives |
+| `hard_multiplier` | 2 | Negatives to sample from Hard bucket |
+| `medium_multiplier` | 2 | Negatives to sample from Medium bucket |
+| `easy_multiplier` | 2 | Negatives to sample from Easy bucket |
+| `stage2_top_queries` | 10 | Similar queries to explore |
+| `stage2_multiplier` | 2 | Negatives to sample from Stage 2 |
+| `cross_encoder_model` | ms-marco.. | Model used for re-ranking |
 
 ## 🚀 Case Study: Financial Domain Adaptation
 
