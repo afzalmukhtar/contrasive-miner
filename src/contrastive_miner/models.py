@@ -92,6 +92,18 @@ class MinerConfig(BaseModel):
     stage1_easy_range: Tuple[int, int] = Field(
         default=(50, 200), description="Index range for easy negatives"
     )
+    use_true_random_easy: bool = Field(
+        default=False,
+        description="If True, sample 'easy' negatives randomly from the entire corpus "
+        "(with low similarity to positives) instead of ranks 50-200. "
+        "Use this for TripletLoss without in-batch negatives. "
+        "Keep False for MNRL which benefits from semi-hard negatives.",
+    )
+    true_random_similarity_threshold: float = Field(
+        default=0.3,
+        description="Max similarity to positive for true random negatives. "
+        "Lower values ensure more dissimilar (easier) negatives.",
+    )
 
     # Stage 2: Topic Neighbors
     stage2_top_queries: int = Field(

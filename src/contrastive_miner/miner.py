@@ -114,6 +114,64 @@ class SemanticNegativeMiner:
         else:
             return self.embedder(texts)
 
+    def _sample_true_random_negatives(
+        self,
+        positives: Set[str],
+        positive_embedding: np.ndarray,
+        n_samples: int,
+        similarity_threshold: float = 0.3,
+    ) -> List[Tuple[str, float]]:
+        """
+        Sample true random negatives from the corpus with low similarity to positives.
+
+        These are completely unrelated chunks, useful for TripletLoss without
+        in-batch negatives. For MNRL, the semi-hard negatives (ranks 50-200) are
+        typically better as in-batch negatives provide the "true random" signal.
+
+        Args:
+            positives: Set of positive texts to exclude
+            positive_embedding: Embedding of the positive to measure similarity
+            n_samples: Number of negatives to sample
+            similarity_threshold: Maximum similarity to positive (lower = more dissimilar)
+
+        Returns:
+            List of (text, similarity_to_positive) tuples
+        """
+        if self.chunk_index is None or len(self.all_chunks) == 0:
+            return []
+
+        # Sample more candidates than needed to account for filtering
+        sample_size = min(n_samples * 10, len(self.all_chunks))
+        candidate_indices = self.rng.choice(
+            len(self.all_chunks), size=sample_size, replace=False
+        )
+
+        # Filter out positives and compute similarity
+        valid_candidates = []
+        for idx in candidate_indices:
+            text = self.all_chunks[idx]
+            if text in positives:
+                continue
+
+            # Get embedding and compute similarity to positive
+            chunk_embedding = self.chunk_index.embeddings[idx]
+            similarity = float(
+                np.dot(positive_embedding.flatten(), chunk_embedding.flatten())
+                / (
+                    np.linalg.norm(positive_embedding) * np.linalg.norm(chunk_embedding)
+                    + 1e-8
+                )
+            )
+
+            # Keep only low-similarity chunks
+            if similarity < similarity_threshold:
+                valid_candidates.append((text, similarity))
+
+            if len(valid_candidates) >= n_samples:
+                break
+
+        return valid_candidates
+
     def build_indices(self, data: List[Dict[str, Any]]) -> None:
         """
         Build chunk and query indices from data.
@@ -305,26 +363,51 @@ class SemanticNegativeMiner:
             medium_sims = [medium_pool[i][1] for i in medium_indices]
             stats.avg_medium_similarity = float(np.mean(medium_sims))
 
-        # Sample Easy
-        easy_pool = ranked["easy"]
-        n_easy = min(len(easy_pool), cfg.easy_multiplier * cfg.multiplier)
-        if n_easy > 0 and len(easy_pool) > 0:
-            easy_indices = self.rng.choice(
-                len(easy_pool), size=min(n_easy, len(easy_pool)), replace=False
+        # Sample Easy (or True Random if configured)
+        n_easy = cfg.easy_multiplier * cfg.multiplier
+
+        if cfg.use_true_random_easy:
+            # True Random: Sample from entire corpus with low similarity to positive
+            true_random_candidates = self._sample_true_random_negatives(
+                positives=positives,
+                positive_embedding=positive_embedding,
+                n_samples=n_easy,
+                similarity_threshold=cfg.true_random_similarity_threshold,
             )
-            for idx in easy_indices:
-                text, score = easy_pool[idx]
+            for text, similarity in true_random_candidates:
                 candidates.append(
                     CandidateNegative(
                         text=text,
-                        score=score,
-                        source="stage1_easy",
-                        query_similarity=score,
+                        score=similarity,
+                        source="stage1_true_random",
+                        query_similarity=similarity,
                     )
                 )
-            stats.stage1_easy_sampled = len(easy_indices)
-            easy_sims = [easy_pool[i][1] for i in easy_indices]
-            stats.avg_easy_similarity = float(np.mean(easy_sims))
+            stats.stage1_easy_sampled = len(true_random_candidates)
+            if true_random_candidates:
+                stats.avg_easy_similarity = float(
+                    np.mean([sim for _, sim in true_random_candidates])
+                )
+        else:
+            # Semi-Hard: Use rank 50-200 pool (default for MNRL)
+            easy_pool = ranked["easy"]
+            if n_easy > 0 and len(easy_pool) > 0:
+                easy_indices = self.rng.choice(
+                    len(easy_pool), size=min(n_easy, len(easy_pool)), replace=False
+                )
+                for idx in easy_indices:
+                    text, score = easy_pool[idx]
+                    candidates.append(
+                        CandidateNegative(
+                            text=text,
+                            score=score,
+                            source="stage1_easy",
+                            query_similarity=score,
+                        )
+                    )
+                stats.stage1_easy_sampled = len(easy_indices)
+                easy_sims = [easy_pool[i][1] for i in easy_indices]
+                stats.avg_easy_similarity = float(np.mean(easy_sims))
 
         return candidates, stats
 

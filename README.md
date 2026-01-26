@@ -109,6 +109,25 @@ Supports multiple formats:
 | `stage2_top_queries` | 10 | Similar queries to explore |
 | `stage2_multiplier` | 2 | Negatives to sample from Stage 2 |
 | `cross_encoder_model` | ms-marco.. | Model used for re-ranking |
+| `use_true_random_easy` | False | Use true random negatives instead of ranks 50-200 |
+| `true_random_similarity_threshold` | 0.3 | Max similarity for true random negatives |
+
+### When to Use True Random Negatives
+
+By default, the "Easy" bucket draws from ranks 50-200, which are **semi-hard negatives** (still top retrieved results sharing keywords/concepts with the query).
+
+| Loss Function | Recommended Setting | Reason |
+|---------------|---------------------|--------|
+| **MNRL** (batch > 32) | `use_true_random_easy=False` (default) | Other rows in the batch provide the "true random" signal |
+| **TripletLoss** (without in-batch negatives) | `use_true_random_easy=True` | Need explicit true random negatives |
+
+```python
+# For TripletLoss without in-batch negatives
+config = MinerConfig(
+    use_true_random_easy=True,
+    true_random_similarity_threshold=0.3,  # Lower = more dissimilar
+)
+```
 
 ## 🚀 Case Study: Financial Domain Adaptation
 
