@@ -7,10 +7,11 @@ Defines the data structures for:
 - MinerConfig: Configuration for the mining process
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Tuple
-from pydantic import BaseModel, Field
 import json
+from dataclasses import asdict, dataclass, field
+from typing import List, Optional, Tuple
+
+from pydantic import BaseModel, Field
 
 
 @dataclass
@@ -79,7 +80,7 @@ class MinerConfig(BaseModel):
         description="Number of candidates to retrieve for stratified mining",
     )
     stage1_similarity_threshold: float = Field(
-        default=0.75,
+        default=0.6,
         description="Filter candidates with similarity > threshold to positive",
     )
     stage1_hard_range: Tuple[int, int] = Field(
@@ -109,7 +110,7 @@ class MinerConfig(BaseModel):
         default=10, description="Number of similar queries to retrieve"
     )
     stage2_similarity_threshold: float = Field(
-        default=0.75, description="Filter threshold for stage 2 candidates"
+        default=0.6, description="Filter threshold for stage 2 candidates"
     )
 
     # Sampling multipliers

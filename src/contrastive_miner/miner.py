@@ -11,18 +11,19 @@ Uses default cross-encoder for reranking unless user provides one.
 
 import json
 import logging
-from typing import List, Dict, Any, Set, Tuple, Optional, Callable, Union
-from tqdm import tqdm
-import numpy as np
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from .models import (
-    TripletRow,
-    MinerConfig,
-    save_triplets,
-    CandidateNegative,
-    MiningStats,
-)
+import numpy as np
+from tqdm import tqdm
+
 from .index import VectorIndex
+from .models import (
+    CandidateNegative,
+    MinerConfig,
+    MiningStats,
+    TripletRow,
+    save_triplets,
+)
 from .reranker import Reranker
 from .utils.similarity import filter_by_similarity
 
@@ -95,6 +96,7 @@ class SemanticNegativeMiner:
         self.chunk_index: Optional[VectorIndex] = None
         self.query_index: Optional[VectorIndex] = None
         self.query_to_positives: Dict[str, Set[str]] = {}
+        self.chunk_to_queries: Dict[str, Set[str]] = {}  # Reverse map: chunk -> queries that have it as positive
         self.chunk_to_index: Dict[str, int] = {}
         self.all_chunks: List[str] = []
 
@@ -205,6 +207,12 @@ class SemanticNegativeMiner:
             if anchor not in self.query_to_positives:
                 self.query_to_positives[anchor] = set()
             self.query_to_positives[anchor].update(positives)
+            
+            # Build reverse map: chunk -> queries that have it as positive
+            for p in positives:
+                if p not in self.chunk_to_queries:
+                    self.chunk_to_queries[p] = set()
+                self.chunk_to_queries[p].add(anchor)
 
         self.all_chunks = list(chunks)
         self.chunk_to_index = {chunk: i for i, chunk in enumerate(self.all_chunks)}
@@ -314,6 +322,9 @@ class SemanticNegativeMiner:
             positive_embeddings.append(pos_emb)
         positive_embeddings = np.array(positive_embeddings)
 
+        # Include anchor in exclusion list (anchor text might exist in corpus)
+        texts_to_exclude = positive_texts + [anchor]
+
         # Filter using similarity against ALL positives
         valid_texts, valid_embeddings, filtered_count, query_similarities = (
             filter_by_similarity(
@@ -321,7 +332,7 @@ class SemanticNegativeMiner:
                 positive_embeddings,
                 result_embeddings,
                 candidate_texts,
-                positive_texts,
+                texts_to_exclude,
                 threshold=self.config.stage1_similarity_threshold,
             )
         )
@@ -465,18 +476,38 @@ class SemanticNegativeMiner:
             query_vec, self.config.stage2_top_queries + 1
         )
 
-        # Step 2: Collect Their Positives
+        # Step 2: Collect Their Positives (with safety checks)
+        # Get the set of all similar query anchors for later filtering
+        similar_query_anchors = {r["anchor"] for r in similar_queries if r["anchor"] != anchor}
+        
         candidate_chunks: Set[str] = set()
         for result in similar_queries:
             if result["anchor"] == anchor:
                 continue  # Skip self
 
             for chunk in result["positives"]:
-                # Exclude original positives
-                if chunk not in positives:
+                # Exclude original positives and anchor text itself
+                if chunk not in positives and chunk != anchor:
                     candidate_chunks.add(chunk)
 
-        candidate_list = list(candidate_chunks)
+        # Step 2b: Filter chunks that are positives for queries similar to current anchor
+        # This prevents selecting "Python is interpreted" as negative for "What is Python?"
+        # when another similar query "Explain Python" has it as a positive
+        safe_candidates: Set[str] = set()
+        for chunk in candidate_chunks:
+            # Get all queries that have this chunk as a positive
+            queries_with_chunk = self.chunk_to_queries.get(chunk, set())
+            
+            # Check if any of those queries are in our similar queries list
+            # If so, this chunk might be a valid answer for our anchor too
+            overlapping_queries = queries_with_chunk & similar_query_anchors
+            
+            if not overlapping_queries:
+                # Safe: no similar query has this as a positive
+                safe_candidates.add(chunk)
+            # else: skip - this chunk is a positive for a query similar to ours
+
+        candidate_list = list(safe_candidates)
         stats.stage2_candidates = len(candidate_list)
 
         if len(candidate_list) == 0:
@@ -505,6 +536,9 @@ class SemanticNegativeMiner:
         if found_mask is not None:
             candidate_list = [t for t, found in zip(candidate_list, found_mask) if found]
 
+        # Include anchor in exclusion list
+        texts_to_exclude = positive_texts + [anchor]
+
         # Filter against ALL positives
         valid_texts, valid_embeddings, filtered_count, query_similarities = (
             filter_by_similarity(
@@ -512,7 +546,7 @@ class SemanticNegativeMiner:
                 positive_embeddings,
                 candidate_embeddings,
                 candidate_list,
-                positive_texts,
+                texts_to_exclude,
                 threshold=self.config.stage2_similarity_threshold,
             )
         )

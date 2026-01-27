@@ -2,24 +2,24 @@
 Tests for Contrastive Miner.
 """
 
-import pytest
-import numpy as np
+import json
+import os
 import shutil
 import tempfile
-import os
-import json
-from typing import List, Dict, Set
+from typing import Dict, List, Set
 
-from contrastive_miner.models import (
-    TripletRow,
-    MinerConfig,
-    CandidateNegative,
-    MiningStats,
-)
-from contrastive_miner.miner import SemanticNegativeMiner
+import numpy as np
+import pytest
+
 from contrastive_miner.index import VectorIndex
+from contrastive_miner.miner import SemanticNegativeMiner
+from contrastive_miner.models import (
+    CandidateNegative,
+    MinerConfig,
+    MiningStats,
+    TripletRow,
+)
 from contrastive_miner.reranker import Reranker
-
 
 # --- Mock Embedding Model ---
 
@@ -132,7 +132,7 @@ class TestModels:
 
         # Check new stratified defaults
         assert config.stage1_retrieve_k == 200
-        assert config.stage1_similarity_threshold == 0.75
+        assert config.stage1_similarity_threshold == 0.6
         assert config.stage1_hard_range == (0, 20)
         assert config.stage2_top_queries == 10
         assert config.multiplier == 1
