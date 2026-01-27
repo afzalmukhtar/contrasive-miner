@@ -57,6 +57,12 @@ class VectorIndex:
         norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
         self.normalized_embeddings = self.embeddings / norms
 
+        # Build text -> index mapping for O(1) lookups
+        self._text_to_index: Dict[str, int] = {}
+        for i, meta in enumerate(metadata):
+            if "text" in meta:
+                self._text_to_index[meta["text"]] = i
+
         if self._use_faiss:
             self._build_faiss_index()
 
@@ -214,29 +220,56 @@ class VectorIndex:
         Returns:
             Normalized embedding or None if not found
         """
-        for i, meta in enumerate(self.metadata):
-            if meta.get("text") == text:
-                return self.normalized_embeddings[i]
+        idx = self._text_to_index.get(text)
+        if idx is not None:
+            return self.normalized_embeddings[idx]
         return None
 
-    def batch_get_embeddings(self, texts: List[str]) -> np.ndarray:
+    def get_index_by_text(self, text: str) -> Optional[int]:
+        """
+        Get index for a specific text.
+
+        Args:
+            text: Text to find index for
+
+        Returns:
+            Index or None if not found
+        """
+        return self._text_to_index.get(text)
+
+    def batch_get_embeddings(
+        self, texts: List[str], return_mask: bool = False
+    ) -> Tuple[np.ndarray, Optional[List[bool]]]:
         """
         Get embeddings for multiple texts.
 
         Args:
             texts: List of texts to get embeddings for
+            return_mask: If True, also return a mask of found texts
 
         Returns:
-            Array of embeddings (may be smaller than texts if some not found)
+            Tuple of (embeddings array, optional mask).
+            If return_mask=True, mask[i] is True if texts[i] was found.
+            Embeddings array only contains found embeddings.
         """
         embeddings = []
+        mask = [] if return_mask else None
+        
         for text in texts:
-            emb = self.get_embedding_by_text(text)
-            if emb is not None:
-                embeddings.append(emb)
+            idx = self._text_to_index.get(text)
+            if idx is not None:
+                embeddings.append(self.normalized_embeddings[idx])
+                if mask is not None:
+                    mask.append(True)
+            else:
+                if mask is not None:
+                    mask.append(False)
+                    
         if len(embeddings) == 0:
-            return np.array([]).reshape(0, self.normalized_embeddings.shape[1])
-        return np.array(embeddings)
+            empty = np.array([]).reshape(0, self.normalized_embeddings.shape[1])
+            return (empty, mask) if return_mask else (empty, None)
+        
+        return (np.array(embeddings), mask) if return_mask else (np.array(embeddings), None)
 
     def __len__(self) -> int:
         return len(self.embeddings)

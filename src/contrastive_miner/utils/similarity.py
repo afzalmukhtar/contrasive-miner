@@ -87,22 +87,22 @@ def batch_cosine_similarity(
 
 def filter_by_similarity(
     query_embedding: np.ndarray,
-    positive_embedding: np.ndarray,
+    positive_embeddings: np.ndarray,
     candidate_embeddings: np.ndarray,
     candidate_texts: List[str],
-    positive_text: str,
+    positive_texts: List[str],
     threshold: float = 0.75,
     query_threshold: float = 0.9,
 ) -> Tuple[List[str], np.ndarray, int, np.ndarray]:
     """
-    Filter candidates that are too similar to positive or query.
+    Filter candidates that are too similar to ANY positive or query.
 
     Args:
         query_embedding: Embedding of the query
-        positive_embedding: Embedding of the positive
+        positive_embeddings: Embeddings of ALL positives (M, D) or (D,) for single
         candidate_embeddings: Embeddings of candidates (N, D)
         candidate_texts: Text of each candidate
-        positive_text: Text of the positive (for exact match check)
+        positive_texts: List of ALL positive texts (for exact match check)
         threshold: Similarity threshold for positive (default 0.75)
         query_threshold: Similarity threshold for query (default 0.9)
 
@@ -116,24 +116,38 @@ def filter_by_similarity(
     n_candidates = len(candidate_texts)
 
     if n_candidates == 0:
-        return [], np.array([]).reshape(0, positive_embedding.shape[0]), 0, np.array([])
+        dim = positive_embeddings.shape[-1] if positive_embeddings.ndim > 1 else positive_embeddings.shape[0]
+        return [], np.array([]).reshape(0, dim), 0, np.array([])
 
-    # Compute similarities
-    pos_similarities = batch_cosine_similarity(positive_embedding, candidate_embeddings)
+    # Ensure positive_embeddings is 2D (M, D)
+    if positive_embeddings.ndim == 1:
+        positive_embeddings = positive_embeddings.reshape(1, -1)
+    
+    # Ensure positive_texts is a list/set for fast lookup
+    positive_texts_set = set(positive_texts) if not isinstance(positive_texts, set) else positive_texts
+
+    # Compute query similarities (N,)
     query_similarities = batch_cosine_similarity(query_embedding, candidate_embeddings)
+    
+    # Compute similarities to ALL positives: for each candidate, get max similarity to any positive
+    # This is (M, N) -> take max over M axis -> (N,)
+    max_pos_similarities = np.zeros(n_candidates)
+    for pos_emb in positive_embeddings:
+        pos_sims = batch_cosine_similarity(pos_emb, candidate_embeddings)
+        max_pos_similarities = np.maximum(max_pos_similarities, pos_sims)
 
     # Filter
     valid_indices = []
     filtered_count = 0
 
     for i in range(n_candidates):
-        # Skip exact match
-        if candidate_texts[i] == positive_text:
+        # Skip exact match with ANY positive
+        if candidate_texts[i] in positive_texts_set:
             filtered_count += 1
             continue
 
-        # Skip if too similar to positive
-        if pos_similarities[i] > threshold:
+        # Skip if too similar to ANY positive
+        if max_pos_similarities[i] > threshold:
             filtered_count += 1
             continue
 
@@ -145,9 +159,10 @@ def filter_by_similarity(
         valid_indices.append(i)
 
     if len(valid_indices) == 0:
+        dim = positive_embeddings.shape[1]
         return (
             [],
-            np.array([]).reshape(0, positive_embedding.shape[0]),
+            np.array([]).reshape(0, dim),
             filtered_count,
             np.array([]),
         )

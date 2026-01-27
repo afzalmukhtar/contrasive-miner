@@ -14,7 +14,6 @@ import json
 
 
 @dataclass
-@dataclass
 class TripletRow:
     """
     Final flattened format for Triplet Loss training.
@@ -139,6 +138,9 @@ class MinerConfig(BaseModel):
     # Performance
     use_gpu: bool = Field(default=True, description="Whether to use GPU if available")
     show_progress: bool = Field(default=True, description="Show progress bars")
+    
+    # Reproducibility
+    random_seed: int = Field(default=42, description="Random seed for reproducibility")
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""

@@ -45,9 +45,10 @@ from .transforms import (
     normalize_input_data,
     group_by_anchor,
     explode_positives,
+    sample_data,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     # Core
     "SemanticNegativeMiner",
@@ -65,4 +66,5 @@ __all__ = [
     "normalize_input_data",
     "group_by_anchor",
     "explode_positives",
+    "sample_data",
 ]

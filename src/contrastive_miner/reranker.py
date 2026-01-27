@@ -48,6 +48,7 @@ class Reranker:
         cross_encoder=None,
         rerank_fn: Optional[Callable[[str, List[str]], List[Tuple[str, float]]]] = None,
         use_default_reranker: bool = True,
+        model_name: Optional[str] = None,
     ):
         """
         Initialize the reranker.
@@ -56,9 +57,11 @@ class Reranker:
             cross_encoder: Optional CrossEncoder from sentence-transformers
             rerank_fn: Optional custom reranking function
             use_default_reranker: If True and no other option provided, load default cross-encoder
+            model_name: Model name for default cross-encoder (uses DEFAULT_RERANKER_MODEL if None)
         """
         self.cross_encoder = cross_encoder
         self.rerank_fn = rerank_fn
+        self._model_name = model_name or DEFAULT_RERANKER_MODEL
 
         # Determine which mode to use
         if rerank_fn is not None:
@@ -81,9 +84,9 @@ class Reranker:
         try:
             from sentence_transformers import CrossEncoder
 
-            logger.info(f"Loading default cross-encoder: {DEFAULT_RERANKER_MODEL}")
-            self.cross_encoder = CrossEncoder(DEFAULT_RERANKER_MODEL)
-            logger.info("Default cross-encoder loaded successfully")
+            logger.info(f"Loading cross-encoder: {self._model_name}")
+            self.cross_encoder = CrossEncoder(self._model_name)
+            logger.info("Cross-encoder loaded successfully")
         except ImportError:
             raise ImportError(
                 "sentence-transformers is required for the default reranker. "

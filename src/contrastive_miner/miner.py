@@ -85,8 +85,11 @@ class SemanticNegativeMiner:
         elif rerank_fn is not None:
             self.reranker = Reranker(rerank_fn=rerank_fn)
         else:
-            # Use default cross-encoder
-            self.reranker = Reranker(use_default_reranker=True)
+            # Use default cross-encoder with model from config
+            self.reranker = Reranker(
+                use_default_reranker=True,
+                model_name=self.config.cross_encoder_model,
+            )
 
         # Will be built when data is loaded
         self.chunk_index: Optional[VectorIndex] = None
@@ -96,7 +99,7 @@ class SemanticNegativeMiner:
         self.all_chunks: List[str] = []
 
         # Random number generator for reproducibility
-        self.rng = np.random.default_rng(42)
+        self.rng = np.random.default_rng(self.config.random_seed)
 
         # Internal flag for progress bars
         self._suppress_progress = False
@@ -117,12 +120,12 @@ class SemanticNegativeMiner:
     def _sample_true_random_negatives(
         self,
         positives: Set[str],
-        positive_embedding: np.ndarray,
+        positive_embeddings: np.ndarray,
         n_samples: int,
         similarity_threshold: float = 0.3,
     ) -> List[Tuple[str, float]]:
         """
-        Sample true random negatives from the corpus with low similarity to positives.
+        Sample true random negatives from the corpus with low similarity to ALL positives.
 
         These are completely unrelated chunks, useful for TripletLoss without
         in-batch negatives. For MNRL, the semi-hard negatives (ranks 50-200) are
@@ -130,15 +133,19 @@ class SemanticNegativeMiner:
 
         Args:
             positives: Set of positive texts to exclude
-            positive_embedding: Embedding of the positive to measure similarity
+            positive_embeddings: Embeddings of ALL positives (M, D) to measure similarity
             n_samples: Number of negatives to sample
-            similarity_threshold: Maximum similarity to positive (lower = more dissimilar)
+            similarity_threshold: Maximum similarity to ANY positive (lower = more dissimilar)
 
         Returns:
-            List of (text, similarity_to_positive) tuples
+            List of (text, max_similarity_to_any_positive) tuples
         """
         if self.chunk_index is None or len(self.all_chunks) == 0:
             return []
+
+        # Ensure positive_embeddings is 2D
+        if positive_embeddings.ndim == 1:
+            positive_embeddings = positive_embeddings.reshape(1, -1)
 
         # Sample more candidates than needed to account for filtering
         sample_size = min(n_samples * 10, len(self.all_chunks))
@@ -153,19 +160,17 @@ class SemanticNegativeMiner:
             if text in positives:
                 continue
 
-            # Get embedding and compute similarity to positive
-            chunk_embedding = self.chunk_index.embeddings[idx]
-            similarity = float(
-                np.dot(positive_embedding.flatten(), chunk_embedding.flatten())
-                / (
-                    np.linalg.norm(positive_embedding) * np.linalg.norm(chunk_embedding)
-                    + 1e-8
-                )
-            )
+            # Get embedding and compute max similarity to ANY positive
+            chunk_embedding = self.chunk_index.normalized_embeddings[idx]
+            # Both are normalized, so dot product = cosine similarity
+            max_similarity = 0.0
+            for pos_emb in positive_embeddings:
+                sim = float(np.dot(pos_emb.flatten(), chunk_embedding.flatten()))
+                max_similarity = max(max_similarity, sim)
 
-            # Keep only low-similarity chunks
-            if similarity < similarity_threshold:
-                valid_candidates.append((text, similarity))
+            # Keep only chunks with low similarity to ALL positives
+            if max_similarity < similarity_threshold:
+                valid_candidates.append((text, max_similarity))
 
             if len(valid_candidates) >= n_samples:
                 break
@@ -217,16 +222,24 @@ class SemanticNegativeMiner:
             use_faiss=self.config.use_gpu,  # Map use_gpu to use_faiss
         )
 
+        # Store minimal metadata for query index (just anchor and positives reference)
+        # to avoid duplicating all text data
+        query_metadata = [
+            {"anchor": item["anchor"], "positives": item["positives"]}
+            for item in normalized
+        ]
         self.query_index = VectorIndex(
             embeddings=query_vecs,
-            metadata=normalized,  # Store full items as metadata
+            metadata=query_metadata,
             use_faiss=self.config.use_gpu,
         )
         logger.info("Indices built successfully.")
 
-    def _normalize_data(self, data: List[Dict]) -> List[Dict[str, Any]]:
+    def _normalize_data(self, data: List[Dict], warn: bool = True) -> List[Dict[str, Any]]:
         """Normalize data to consistent format."""
         normalized = []
+        skipped = 0
+        
         for item in data:
             anchor = item.get("anchor") or item.get("query")
             positives = item.get("positives") or item.get("positive")
@@ -238,6 +251,15 @@ class SemanticNegativeMiner:
                 normalized.append(
                     {"anchor": anchor, "positives": positives}  # Keep as list
                 )
+            else:
+                skipped += 1
+        
+        if warn and skipped > 0:
+            logger.warning(
+                f"Skipped {skipped} items with missing anchor or positives. "
+                f"Expected format: {{'anchor': str, 'positives': list}} or "
+                f"{{'query': str, 'positive': str}}"
+            )
 
         return normalized
 
@@ -282,22 +304,24 @@ class SemanticNegativeMiner:
         # Step 2: Filter False Positives
         candidate_texts = [r["text"] for r in results]
 
-        # Get positive embedding for similarity check
-        positive_text = list(positives)[0]  # Use first positive as reference
-        positive_embedding = self.chunk_index.get_embedding_by_text(positive_text)
+        # Get embeddings for ALL positives for similarity check
+        positive_texts = list(positives)
+        positive_embeddings = []
+        for pos_text in positive_texts:
+            pos_emb = self.chunk_index.get_embedding_by_text(pos_text)
+            if pos_emb is None:
+                pos_emb = self._encode(pos_text)
+            positive_embeddings.append(pos_emb)
+        positive_embeddings = np.array(positive_embeddings)
 
-        if positive_embedding is None:
-            # logger.warning(f"Could not find embedding for positive: {positive_text[:50]}")
-            positive_embedding = self._encode(positive_text)
-
-        # Filter using similarity
+        # Filter using similarity against ALL positives
         valid_texts, valid_embeddings, filtered_count, query_similarities = (
             filter_by_similarity(
                 query_vec,
-                positive_embedding,
+                positive_embeddings,
                 result_embeddings,
                 candidate_texts,
-                positive_text,
+                positive_texts,
                 threshold=self.config.stage1_similarity_threshold,
             )
         )
@@ -367,10 +391,10 @@ class SemanticNegativeMiner:
         n_easy = cfg.easy_multiplier * cfg.multiplier
 
         if cfg.use_true_random_easy:
-            # True Random: Sample from entire corpus with low similarity to positive
+            # True Random: Sample from entire corpus with low similarity to ALL positives
             true_random_candidates = self._sample_true_random_negatives(
                 positives=positives,
-                positive_embedding=positive_embedding,
+                positive_embeddings=positive_embeddings,
                 n_samples=n_easy,
                 similarity_threshold=cfg.true_random_similarity_threshold,
             )
@@ -458,28 +482,37 @@ class SemanticNegativeMiner:
         if len(candidate_list) == 0:
             return [], stats
 
-        # Step 3: Filter High Similarity to Original Positive
-        positive_text = list(positives)[0]
-        positive_embedding = self.chunk_index.get_embedding_by_text(positive_text)
+        # Step 3: Filter High Similarity to ALL Original Positives
+        positive_texts = list(positives)
+        positive_embeddings = []
+        for pos_text in positive_texts:
+            pos_emb = self.chunk_index.get_embedding_by_text(pos_text)
+            if pos_emb is None:
+                pos_emb = self._encode(pos_text)
+            positive_embeddings.append(pos_emb)
+        positive_embeddings = np.array(positive_embeddings)
 
-        if positive_embedding is None:
-            positive_embedding = self._encode(positive_text)
-
-        # Get embeddings for candidates
-        candidate_embeddings = self.chunk_index.batch_get_embeddings(candidate_list)
+        # Get embeddings for candidates (with mask to track which were found)
+        candidate_embeddings, found_mask = self.chunk_index.batch_get_embeddings(
+            candidate_list, return_mask=True
+        )
 
         if len(candidate_embeddings) == 0:
-            # logger.warning("Stage 2: Could not find embeddings for candidates")
+            logger.debug("Stage 2: Could not find embeddings for candidates")
             return [], stats
+        
+        # Filter candidate_list to only include found texts
+        if found_mask is not None:
+            candidate_list = [t for t, found in zip(candidate_list, found_mask) if found]
 
-        # Filter
+        # Filter against ALL positives
         valid_texts, valid_embeddings, filtered_count, query_similarities = (
             filter_by_similarity(
                 query_vec,
-                positive_embedding,
+                positive_embeddings,
                 candidate_embeddings,
                 candidate_list,
-                positive_text,
+                positive_texts,
                 threshold=self.config.stage2_similarity_threshold,
             )
         )
@@ -628,7 +661,7 @@ class SemanticNegativeMiner:
                 rows, stats = self.mine_row(item["anchor"], item["positives"])
                 all_rows.extend(rows)
 
-                # Aggregate stats
+                # Aggregate stats (counts)
                 aggregate_stats.stage1_retrieved += stats.stage1_retrieved
                 aggregate_stats.stage1_filtered_similar += stats.stage1_filtered_similar
                 aggregate_stats.stage1_after_filter += stats.stage1_after_filter
@@ -640,10 +673,16 @@ class SemanticNegativeMiner:
                 aggregate_stats.stage2_sampled += stats.stage2_sampled
                 aggregate_stats.total_before_dedup += stats.total_before_dedup
                 aggregate_stats.total_after_dedup += stats.total_after_dedup
+                
+                # Accumulate similarity sums for averaging later
+                aggregate_stats.avg_hard_similarity += stats.avg_hard_similarity
+                aggregate_stats.avg_medium_similarity += stats.avg_medium_similarity
+                aggregate_stats.avg_easy_similarity += stats.avg_easy_similarity
+                aggregate_stats.avg_stage2_similarity += stats.avg_stage2_similarity
         finally:
             self._suppress_progress = False
 
-        # Compute averages for quality metrics
+        # Compute averages for quality metrics (divide accumulated sums)
         n = len(normalized_data)
         if n > 0:
             aggregate_stats.avg_hard_similarity /= n
