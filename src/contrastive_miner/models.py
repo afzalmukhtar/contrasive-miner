@@ -137,9 +137,23 @@ class MinerConfig(BaseModel):
     )
 
     # Performance
-    use_gpu: bool = Field(default=True, description="Whether to use GPU if available")
+    use_faiss: bool = Field(
+        default=True, description="Whether to use FAISS for vector search (faster)"
+    )
+    embedding_device: str = Field(
+        default="cuda",
+        description="Device for embedding model ('cuda', 'cpu', or 'mps')",
+    )
     show_progress: bool = Field(default=True, description="Show progress bars")
-    
+    skip_empty_results: bool = Field(
+        default=False,
+        description="If True, skip rows with no negatives. If False, use fallback random sampling.",
+    )
+    fallback_negative_count: int = Field(
+        default=5,
+        description="Number of random negatives to sample as fallback when mining finds none",
+    )
+
     # Reproducibility
     random_seed: int = Field(default=42, description="Random seed for reproducibility")
 
@@ -209,6 +223,7 @@ class MiningStats:
     # Final
     total_before_dedup: int = 0
     total_after_dedup: int = 0
+    fallback_sampled: int = 0  # Random fallback when mining finds nothing
 
     # Quality metrics
     avg_hard_similarity: float = 0.0
@@ -235,6 +250,8 @@ class MiningStats:
         logger.info("-" * 60)
         logger.info(f"Total Before Dedup: {self.total_before_dedup}")
         logger.info(f"Total After Dedup: {self.total_after_dedup}")
+        if self.fallback_sampled > 0:
+            logger.info(f"Fallback Random Sampled: {self.fallback_sampled}")
         logger.info("-" * 60)
         logger.info(f"Avg Hard Similarity: {self.avg_hard_similarity:.3f}")
         logger.info(f"Avg Medium Similarity: {self.avg_medium_similarity:.3f}")

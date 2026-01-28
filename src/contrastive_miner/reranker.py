@@ -6,8 +6,8 @@ Uses a default cross-encoder from sentence-transformers or accepts:
 - A user-provided reranking function with signature: (query: str, candidates: List[str]) -> List[Tuple[str, float]]
 """
 
-from typing import List, Dict, Optional, Tuple, Callable, Protocol
 import logging
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -200,3 +200,94 @@ class Reranker:
             "medium": all_ranked[medium_range[0] : medium_range[1]],
             "easy": all_ranked[easy_range[0] : easy_range[1]],
         }
+
+    def batch_rerank(
+        self,
+        queries: List[str],
+        candidates_list: List[List[str]],
+        batch_size: int = 32,
+    ) -> List[List[Tuple[str, float]]]:
+        """
+        Batch rerank multiple query-candidate sets for better GPU utilization.
+
+        Args:
+            queries: List of query texts
+            candidates_list: List of candidate lists (one per query)
+            batch_size: Batch size for cross-encoder inference
+
+        Returns:
+            List of ranked results (one list per query)
+        """
+        if self._mode == "custom_fn":
+            # Custom functions don't support batching, fall back to sequential
+            return [self.rerank_fn(q, c) for q, c in zip(queries, candidates_list)]
+
+        if not queries:
+            return []
+
+        # Build all pairs with tracking of which query they belong to
+        all_pairs = []
+        query_indices = []  # Track which query each pair belongs to
+        candidate_indices = []  # Track which candidate within the query
+
+        for q_idx, (query, candidates) in enumerate(zip(queries, candidates_list)):
+            for c_idx, candidate in enumerate(candidates):
+                all_pairs.append([query, candidate])
+                query_indices.append(q_idx)
+                candidate_indices.append(c_idx)
+
+        if not all_pairs:
+            return [[] for _ in queries]
+
+        # Batch predict all pairs at once
+        all_scores = self.cross_encoder.predict(
+            all_pairs, batch_size=batch_size, show_progress_bar=False
+        )
+
+        # Reconstruct per-query results
+        results: List[List[Tuple[str, float]]] = [[] for _ in queries]
+        for i, score in enumerate(all_scores):
+            q_idx = query_indices[i]
+            c_idx = candidate_indices[i]
+            candidate = candidates_list[q_idx][c_idx]
+            results[q_idx].append((candidate, float(score)))
+
+        # Sort each query's results by score descending
+        for i in range(len(results)):
+            results[i].sort(key=lambda x: x[1], reverse=True)
+
+        return results
+
+    def batch_rerank_to_bins(
+        self,
+        queries: List[str],
+        candidates_list: List[List[str]],
+        hard_range: Tuple[int, int] = (0, 20),
+        medium_range: Tuple[int, int] = (20, 50),
+        easy_range: Tuple[int, int] = (50, 200),
+        batch_size: int = 32,
+    ) -> List[Dict[str, List[Tuple[str, float]]]]:
+        """
+        Batch rerank and bin multiple query-candidate sets.
+
+        Args:
+            queries: List of query texts
+            candidates_list: List of candidate lists (one per query)
+            hard_range: Index range for hard negatives
+            medium_range: Index range for medium negatives
+            easy_range: Index range for easy negatives
+            batch_size: Batch size for cross-encoder inference
+
+        Returns:
+            List of bin dicts (one per query)
+        """
+        all_ranked = self.batch_rerank(queries, candidates_list, batch_size)
+
+        return [
+            {
+                "hard": ranked[hard_range[0] : hard_range[1]],
+                "medium": ranked[medium_range[0] : medium_range[1]],
+                "easy": ranked[easy_range[0] : easy_range[1]],
+            }
+            for ranked in all_ranked
+        ]

@@ -96,7 +96,9 @@ class SemanticNegativeMiner:
         self.chunk_index: Optional[VectorIndex] = None
         self.query_index: Optional[VectorIndex] = None
         self.query_to_positives: Dict[str, Set[str]] = {}
-        self.chunk_to_queries: Dict[str, Set[str]] = {}  # Reverse map: chunk -> queries that have it as positive
+        self.chunk_to_queries: Dict[
+            str, Set[str]
+        ] = {}  # Reverse map: chunk -> queries that have it as positive
         self.chunk_to_index: Dict[str, int] = {}
         self.all_chunks: List[str] = []
 
@@ -114,7 +116,7 @@ class SemanticNegativeMiner:
                 batch_size=self.config.batch_size,
                 show_progress_bar=not self._suppress_progress
                 and self.config.show_progress,
-                device="cuda" if self.config.use_gpu else "cpu",
+                device=self.config.embedding_device,
             )
         else:
             return self.embedder(texts)
@@ -179,6 +181,60 @@ class SemanticNegativeMiner:
 
         return valid_candidates
 
+    def _sample_fallback_random_negatives(
+        self,
+        positives: Set[str],
+        anchor: str,
+        n_samples: int,
+    ) -> List[CandidateNegative]:
+        """
+        Sample random negatives as fallback when mining stages find nothing.
+
+        Simply samples random chunks from the corpus that aren't positives or anchor.
+        These are tagged with source='fallback_random' for tracking.
+
+        Args:
+            positives: Set of positive texts to exclude
+            anchor: Anchor text to exclude
+            n_samples: Number of negatives to sample
+
+        Returns:
+            List of CandidateNegative with source='fallback_random'
+        """
+        if self.chunk_index is None or len(self.all_chunks) == 0:
+            return []
+
+        # Build exclusion set
+        exclude_set = positives | {anchor}
+
+        # Sample candidates
+        sample_size = min(
+            n_samples * 3, len(self.all_chunks)
+        )  # Oversample to account for exclusions
+        candidate_indices = self.rng.choice(
+            len(self.all_chunks), size=sample_size, replace=False
+        )
+
+        candidates = []
+        for idx in candidate_indices:
+            text = self.all_chunks[idx]
+            if text in exclude_set:
+                continue
+
+            candidates.append(
+                CandidateNegative(
+                    text=text,
+                    score=0.0,  # No relevance score for random
+                    source="fallback_random",
+                    query_similarity=0.0,
+                )
+            )
+
+            if len(candidates) >= n_samples:
+                break
+
+        return candidates
+
     def build_indices(self, data: List[Dict[str, Any]]) -> None:
         """
         Build chunk and query indices from data.
@@ -207,7 +263,7 @@ class SemanticNegativeMiner:
             if anchor not in self.query_to_positives:
                 self.query_to_positives[anchor] = set()
             self.query_to_positives[anchor].update(positives)
-            
+
             # Build reverse map: chunk -> queries that have it as positive
             for p in positives:
                 if p not in self.chunk_to_queries:
@@ -227,27 +283,40 @@ class SemanticNegativeMiner:
         self.chunk_index = VectorIndex(
             embeddings=chunk_embeddings,
             metadata=[{"text": t} for t in self.all_chunks],
-            use_faiss=self.config.use_gpu,  # Map use_gpu to use_faiss
+            use_faiss=self.config.use_faiss,
         )
 
-        # Store minimal metadata for query index (just anchor and positives reference)
-        # to avoid duplicating all text data
+        # Deduplicate queries - keep only unique anchors with merged positives
+        unique_query_indices = []
+        seen_anchors: Set[str] = set()
+        for i, item in enumerate(normalized):
+            if item["anchor"] not in seen_anchors:
+                seen_anchors.add(item["anchor"])
+                unique_query_indices.append(i)
+
+        # Build query index with deduplicated queries
+        unique_query_vecs = query_vecs[unique_query_indices]
         query_metadata = [
-            {"anchor": item["anchor"], "positives": item["positives"]}
-            for item in normalized
+            {
+                "anchor": normalized[i]["anchor"],
+                "positives": list(self.query_to_positives[normalized[i]["anchor"]]),
+            }
+            for i in unique_query_indices
         ]
         self.query_index = VectorIndex(
-            embeddings=query_vecs,
+            embeddings=unique_query_vecs,
             metadata=query_metadata,
-            use_faiss=self.config.use_gpu,
+            use_faiss=self.config.use_faiss,
         )
         logger.info("Indices built successfully.")
 
-    def _normalize_data(self, data: List[Dict], warn: bool = True) -> List[Dict[str, Any]]:
+    def _normalize_data(
+        self, data: List[Dict], warn: bool = True
+    ) -> List[Dict[str, Any]]:
         """Normalize data to consistent format."""
         normalized = []
         skipped = 0
-        
+
         for item in data:
             anchor = item.get("anchor") or item.get("query")
             positives = item.get("positives") or item.get("positive")
@@ -261,7 +330,7 @@ class SemanticNegativeMiner:
                 )
             else:
                 skipped += 1
-        
+
         if warn and skipped > 0:
             logger.warning(
                 f"Skipped {skipped} items with missing anchor or positives. "
@@ -478,8 +547,10 @@ class SemanticNegativeMiner:
 
         # Step 2: Collect Their Positives (with safety checks)
         # Get the set of all similar query anchors for later filtering
-        similar_query_anchors = {r["anchor"] for r in similar_queries if r["anchor"] != anchor}
-        
+        similar_query_anchors = {
+            r["anchor"] for r in similar_queries if r["anchor"] != anchor
+        }
+
         candidate_chunks: Set[str] = set()
         for result in similar_queries:
             if result["anchor"] == anchor:
@@ -497,11 +568,11 @@ class SemanticNegativeMiner:
         for chunk in candidate_chunks:
             # Get all queries that have this chunk as a positive
             queries_with_chunk = self.chunk_to_queries.get(chunk, set())
-            
+
             # Check if any of those queries are in our similar queries list
             # If so, this chunk might be a valid answer for our anchor too
             overlapping_queries = queries_with_chunk & similar_query_anchors
-            
+
             if not overlapping_queries:
                 # Safe: no similar query has this as a positive
                 safe_candidates.add(chunk)
@@ -531,10 +602,12 @@ class SemanticNegativeMiner:
         if len(candidate_embeddings) == 0:
             logger.debug("Stage 2: Could not find embeddings for candidates")
             return [], stats
-        
+
         # Filter candidate_list to only include found texts
         if found_mask is not None:
-            candidate_list = [t for t, found in zip(candidate_list, found_mask) if found]
+            candidate_list = [
+                t for t, found in zip(candidate_list, found_mask) if found
+            ]
 
         # Include anchor in exclusion list
         texts_to_exclude = positive_texts + [anchor]
@@ -641,6 +714,16 @@ class SemanticNegativeMiner:
 
         combined_stats.total_after_dedup = len(unique_candidates)
 
+        # Fallback: if no negatives found, sample random chunks
+        if len(unique_candidates) == 0 and not self.config.skip_empty_results:
+            fallback_candidates = self._sample_fallback_random_negatives(
+                positives=positives_set,
+                anchor=anchor,
+                n_samples=self.config.fallback_negative_count,
+            )
+            unique_candidates = fallback_candidates
+            combined_stats.fallback_sampled = len(fallback_candidates)
+
         # Create rows (one per positive)
         rows = []
         for positive in positives:
@@ -690,9 +773,17 @@ class SemanticNegativeMiner:
 
         logger.info("Mining negatives with stratified sampling...")
         self._suppress_progress = True
+        skipped_empty = 0
         try:
             for item in tqdm(normalized_data, desc="Mining"):
                 rows, stats = self.mine_row(item["anchor"], item["positives"])
+
+                # Handle empty results
+                if self.config.skip_empty_results:
+                    non_empty_rows = [r for r in rows if r.negatives]
+                    skipped_empty += len(rows) - len(non_empty_rows)
+                    rows = non_empty_rows
+
                 all_rows.extend(rows)
 
                 # Aggregate stats (counts)
@@ -707,7 +798,8 @@ class SemanticNegativeMiner:
                 aggregate_stats.stage2_sampled += stats.stage2_sampled
                 aggregate_stats.total_before_dedup += stats.total_before_dedup
                 aggregate_stats.total_after_dedup += stats.total_after_dedup
-                
+                aggregate_stats.fallback_sampled += stats.fallback_sampled
+
                 # Accumulate similarity sums for averaging later
                 aggregate_stats.avg_hard_similarity += stats.avg_hard_similarity
                 aggregate_stats.avg_medium_similarity += stats.avg_medium_similarity
@@ -726,6 +818,8 @@ class SemanticNegativeMiner:
 
         if log_stats:
             aggregate_stats.log_summary(logger)
+            if skipped_empty > 0:
+                logger.warning(f"Skipped {skipped_empty} rows with no negatives")
 
         # Save if path provided
         if output_path:

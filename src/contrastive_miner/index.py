@@ -4,9 +4,10 @@ Vector Index for fast similarity search.
 Supports both FAISS (if available) and NumPy fallback for cosine similarity.
 """
 
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
 import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,7 @@ class VectorIndex:
         """
         embeddings = []
         mask = [] if return_mask else None
-        
+
         for text in texts:
             idx = self._text_to_index.get(text)
             if idx is not None:
@@ -264,12 +265,16 @@ class VectorIndex:
             else:
                 if mask is not None:
                     mask.append(False)
-                    
+
         if len(embeddings) == 0:
             empty = np.array([]).reshape(0, self.normalized_embeddings.shape[1])
             return (empty, mask) if return_mask else (empty, None)
-        
-        return (np.array(embeddings), mask) if return_mask else (np.array(embeddings), None)
+
+        return (
+            (np.array(embeddings), mask)
+            if return_mask
+            else (np.array(embeddings), None)
+        )
 
     def __len__(self) -> int:
         return len(self.embeddings)
